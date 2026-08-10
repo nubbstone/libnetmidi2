@@ -36,10 +36,10 @@ no platform headers** — safe for Zephyr.
 include/netmidi2/
   Protocol.h   ✅ wire format: signature, command codes, big-endian build/parse
   Platform.h   ✅ injected I/O interfaces (IUdpSocket / IClock / IDiscovery)
-  Session.h    ⏳ session state machine (Idle→Pending→Established), seq/ping/bye
+  Session.h    ✅ session state machine (Idle→Inviting→Established), seq/ping/bye, both roles
 PROTOCOL.md    ✅ the shared wire contract (faithful profile of M2-124-UM)
-CMakeLists.txt ✅ target `netmidi2`
-tests/         ⏳ conformance vectors from spec Appendix A.1
+CMakeLists.txt ✅ target `netmidi2` + loopback test
+tests/         ✅ session_loopback.cpp (Host+Client over real localhost UDP); ⏳ spec A.1 vectors
 adapters/juce/ ⏳ JUCE implementations of the Platform interfaces (host side)
 ```
 
@@ -61,8 +61,8 @@ Nothing else in the host changes — network is just another UMP source/sink.
 | Phase | Deliverable | Status |
 |---|---|---|
 | N0 | Wire format (`Protocol.h`) + platform interfaces + contract doc | ✅ done |
-| N1 | `Session` state machine: Invitation/Accepted, Ping/Bye, UMP Data (explicit host:port) | ⏳ next |
-| N1 | JUCE platform adapters + host `NetworkUmpFrontDoor` → prove a UMP crosses the LAN into Surge | ⏳ |
+| N1 | `Session` state machine: Invitation/Accepted, Ping/Bye, UMP Data (explicit host:port) | ✅ done + loopback test |
+| N1 | JUCE platform adapters + host `NetworkUmpFrontDoor` → prove a UMP crosses the LAN into Surge | ⏳ next |
 | N2 | mDNS discovery (`_midi2._udp`), FEC + retransmit robustness | — |
 | N3 | Authentication (Invitation w/ Auth), multi-peer, UI panel | — |
 

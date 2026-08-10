@@ -3,7 +3,8 @@
 
     The protocol core is OS-agnostic; the host injects concrete I/O. macOS supplies
     these with JUCE (DatagramSocket, NetworkServiceDiscovery, Time); Zephyr supplies
-    them with zsock_*/k_uptime/its mDNS responder. Keep implementations non-blocking.
+    them with its BSD sockets, k_uptime, and mDNS responder. Keep implementations
+    non-blocking.
 */
 
 #pragma once

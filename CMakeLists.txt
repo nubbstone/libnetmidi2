@@ -16,3 +16,11 @@ target_include_directories(netmidi2 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_compile_features(netmidi2 INTERFACE cxx_std_17)
 
 # Consumers: target_link_libraries(<their_target> PRIVATE netmidi2)
+
+# Loopback test — runs a Host + Client Session over real localhost UDP (POSIX only).
+if(UNIX AND NOT NETMIDI2_SKIP_TESTS)
+    add_executable(nm2_session_loopback tests/session_loopback.cpp)
+    target_link_libraries(nm2_session_loopback PRIVATE netmidi2)
+    enable_testing()
+    add_test(NAME nm2_session_loopback COMMAND nm2_session_loopback)
+endif()
