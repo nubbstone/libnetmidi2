@@ -62,9 +62,10 @@ Nothing else in the host changes — network is just another UMP source/sink.
 |---|---|---|
 | N0 | Wire format (`Protocol.h`) + platform interfaces + contract doc | ✅ done |
 | N1 | `Session` state machine: Invitation/Accepted, Ping/Bye, UMP Data (explicit host:port) | ✅ done + loopback test |
-| N1 | JUCE platform adapters + host `NetworkUmpFrontDoor` → prove a UMP crosses the LAN into Surge | ⏳ next |
+| N1 | JUCE platform adapters + host `NetworkUmpFrontDoor` + connect UI, **both directions** (recv→plugin, send local UMP→peer) | ✅ done (`--nettest`) |
+| —  | Cross-device test against the real Teensy (titou lib) over the LAN | ⏳ next (needs Teensy IP:port + role) |
 | N2 | mDNS discovery (`_midi2._udp`), FEC + retransmit robustness | — |
-| N3 | Authentication (Invitation w/ Auth), multi-peer, UI panel | — |
+| N3 | Authentication (Invitation w/ Auth), multi-peer | — |
 
 ## References
 
