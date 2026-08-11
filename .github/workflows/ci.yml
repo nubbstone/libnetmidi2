@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test (UDP loopback)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  freestanding:
+    name: core compiles freestanding (no exceptions/RTTI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Protocol.h + Session.h with -fno-exceptions -fno-rtti
+        run: |
+          printf '#include <netmidi2/Session.h>\nint main(){ return 0; }\n' > /tmp/freestanding.cpp
+          g++ -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra -Werror \
+              -Iinclude /tmp/freestanding.cpp -o /tmp/freestanding

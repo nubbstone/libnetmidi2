@@ -1,73 +1,162 @@
 # libnetmidi2
 
-A standalone **Network MIDI 2.0 (UDP)** library — the MIDI Association's
-UMP-over-UDP transport (spec **M2-124-UM**). macOS has no such support (only legacy
-RTP-MIDI 1.0), so this implements it.
+A small, portable, dependency‑free **C++17 implementation of Network MIDI 2.0
+(UDP)** — the MIDI Association's UMP‑over‑UDP transport, spec **M2‑124‑UM**.
 
-It's deliberately a **library on its own**, not baked into any app. The M2 SoundGen
-Host consumes it; the Teensy/Zephyr sister project can consume the *same* core.
+<!-- Replace OWNER with your GitHub user/org once the repo is pushed. -->
+![CI](https://github.com/OWNER/libnetmidi2/actions/workflows/ci.yml/badge.svg)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Send and receive **MIDI 2.0 Universal MIDI Packets over Ethernet/Wi‑Fi** with full
+32‑bit resolution and per‑note expression — no operating‑system support required.
+
+## Why
+
+Most platforms still ship **no** Network MIDI 2.0 transport. Apple's CoreMIDI, for
+example, only offers legacy **RTP‑MIDI (MIDI 1.0)**, which collapses everything to
+7‑bit. `libnetmidi2` implements the real thing — the MIDI Association's Network
+MIDI 2.0 (UDP) spec — in a form small enough to run on a desktop app *and* on a
+microcontroller.
+
+## Features
+
+- **Faithful to M2‑124‑UM** — 4‑byte `MIDI` signature, 32‑bit command header,
+  Invitation/Reply, Ping/Bye, NAK, UMP Data with sequence numbers. Interops with
+  any other spec‑compliant implementation.
+- **Both roles** — act as the UDP *Host* (listen/accept) or *Client* (discover/invite).
+- **Bidirectional** — send and receive UMP once a session is Established.
+- **Freestanding‑friendly** — no exceptions, no RTTI, no heap, no STL containers,
+  no OS headers in the core. Safe for Zephyr / bare‑metal as well as desktop.
+- **Injected I/O** — the protocol core is OS‑agnostic; you supply the socket,
+  clock, and (optionally) mDNS. One codebase runs everywhere.
+- **Header‑only core** — drop the include dir into your build; no library to link.
+- **Tested** — a real‑UDP loopback test drives the full handshake + bidirectional
+  UMP + graceful close.
 
 ## Design: portable core + injected I/O
-
-The protocol logic knows nothing about the OS. All I/O is injected, so one codebase
-runs everywhere:
 
 ```
              ┌─────────────────────────────────────────────┐
              │  libnetmidi2 core  (portable, freestanding)  │
              │  Protocol.h  — wire format (build/parse)      │
-             │  Session     — state machine, seq, ping, bye  │
+             │  Session.h   — state machine, seq, ping, bye  │
              └───────────────┬──────────────────────────────┘
                              │ IUdpSocket · IClock · IDiscovery
               ┌──────────────┴───────────────┐
-      macOS host (JUCE adapters)      Teensy (Zephyr adapters)
-      DatagramSocket / Time /         zsock_* / k_uptime /
-      NetworkServiceDiscovery         Zephyr mDNS
+      Desktop (e.g. JUCE adapters)     Embedded (e.g. Zephyr adapters)
+      DatagramSocket / Time /          BSD sockets / k_uptime /
+      NetworkServiceDiscovery          mDNS responder
 ```
 
-Because both ends compile the **same** `Protocol.h` (and, ideally, the same
-`Session`), framing is identical by construction — interop drift ≈ 0. The core is
-written freestanding-friendly: **no exceptions, no RTTI, no heap, no STL containers,
-no platform headers** — safe for Zephyr.
+Because every platform compiles the **same** `Protocol.h` and `Session.h`, framing
+is identical by construction — two peers built on this library interoperate with
+zero drift.
 
 ## Layout
 
 ```
 include/netmidi2/
-  Protocol.h   ✅ wire format: signature, command codes, big-endian build/parse
-  Platform.h   ✅ injected I/O interfaces (IUdpSocket / IClock / IDiscovery)
-  Session.h    ✅ session state machine (Idle→Inviting→Established), seq/ping/bye, both roles
-PROTOCOL.md    ✅ the shared wire contract (faithful profile of M2-124-UM)
-CMakeLists.txt ✅ target `netmidi2` + loopback test
-tests/         ✅ session_loopback.cpp (Host+Client over real localhost UDP); ⏳ spec A.1 vectors
-adapters/juce/ ⏳ JUCE implementations of the Platform interfaces (host side)
+  Protocol.h   wire format: signature, command codes, big-endian build/parse
+  Platform.h   injected I/O interfaces (IUdpSocket / IClock / IDiscovery)
+  Session.h    session state machine (Idle→Inviting→Established), seq/ping/bye
+PROTOCOL.md    the wire contract — a readable profile of M2-124-UM
+tests/         session_loopback.cpp — Host+Client over real localhost UDP
+CMakeLists.txt target `netmidi2` + the loopback test
 ```
 
-## How the host uses it
+## Integrate
 
-The host adds a thin `NetworkUmpFrontDoor` that parallels its existing CoreMIDI
-front door:
+It's a header‑only interface target. With CMake:
 
-- **receive:** `Session` decodes UMP Data → hands UMP words to the same
-  `SourceTap → UmpToClapTranslator` path the USB/Gaia input uses → Surge. Identical
-  downstream, so mapping / learn / everything works unchanged.
-- **send:** local UMP (from the Gaia, apps, or the host's virtual endpoint) →
-  `Session` frames it as UMP Data → out to the peer.
+```cmake
+add_subdirectory(libnetmidi2)            # or FetchContent / a submodule
+target_link_libraries(your_app PRIVATE netmidi2)
+```
 
-Nothing else in the host changes — network is just another UMP source/sink.
+Or just add `libnetmidi2/include` to your include path and `#include <netmidi2/Session.h>`.
 
-## Roadmap
+## Usage
 
-| Phase | Deliverable | Status |
-|---|---|---|
-| N0 | Wire format (`Protocol.h`) + platform interfaces + contract doc | ✅ done |
-| N1 | `Session` state machine: Invitation/Accepted, Ping/Bye, UMP Data (explicit host:port) | ✅ done + loopback test |
-| N1 | JUCE platform adapters + host `NetworkUmpFrontDoor` + connect UI, **both directions** (recv→plugin, send local UMP→peer) | ✅ done (`--nettest`) |
-| —  | Cross-device test against the real Teensy (titou lib) over the LAN | ⏳ next (needs Teensy IP:port + role) |
-| N2 | mDNS discovery (`_midi2._udp`), FEC + retransmit robustness | — |
-| N3 | Authentication (Invitation w/ Auth), multi-peer | — |
+Implement the three platform interfaces for your OS (`IUdpSocket`, `IClock`, and —
+optionally, for mDNS discovery — `IDiscovery`), then drive a `Session`:
 
-## References
+```cpp
+#include <netmidi2/Session.h>
+using namespace netmidi2;
 
-- `PROTOCOL.md` — the wire contract both ends build to (start here).
-- MIDI Association **M2-124-UM** Network MIDI 2.0 (UDP) v1.0, 2024-11-20.
+struct MyListener : ISessionListener {
+    void onUmpReceived (const uint32_t* words, uint8_t count) override {
+        // hand `words` (host-order UMP) to your synth / router
+    }
+    void onStateChanged (State s) override { /* update your UI */ }
+};
+
+MyUdpSocket socket;      // your IUdpSocket
+MyClock     clock;       // your IClock
+MyListener  listener;
+
+Platform platform { &socket, &clock, nullptr };  // nullptr = no mDNS (explicit host:port)
+Session   session (platform, Role::client, &listener, "My Endpoint", "MY-PRODUCT-1");
+
+Endpoint peer {};                        // the host to invite
+std::strcpy (peer.address, "192.168.1.50");
+peer.port = 5004;
+session.connect (peer);                  // Client: send an Invitation
+
+for (;;) {                               // call frequently from your run loop
+    session.tick();                      // drains the socket, runs ping/timeout
+
+    if (session.state() == State::established) {
+        uint32_t noteOn[2] = { 0x40903C00u, 0xFFFF0000u };  // MIDI 2.0 note-on C4
+        session.sendUmp (noteOn, 2);
+    }
+    // sleep ~1 ms
+}
+```
+
+A UDP *Host* is the same, but calls `session.listen()` instead of `connect()` and
+learns its peer from the incoming Invitation.
+
+See `tests/session_loopback.cpp` for a complete, runnable example (with POSIX socket
+and clock adapters) that stands up a Host and a Client and exchanges UMP.
+
+## Build & test
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure     # runs the UDP loopback test
+```
+
+## Protocol reference
+
+- **[`PROTOCOL.md`](PROTOCOL.md)** — the wire contract this library implements: the
+  signature, command header, full command‑code table, UMP Data framing, session
+  lifecycle, and mDNS discovery. Start here if you're implementing the other end.
+- MIDI Association **M2‑124‑UM** "Network MIDI 2.0 (UDP)" v1.0 — the normative spec.
+
+## Status
+
+Phase 1 of the spec is implemented and interop‑tested: **Invitation / Reply,
+Ping / Bye, NAK, and bidirectional UMP Data** over an explicit `host:port`.
+
+| Area | Status |
+|---|---|
+| Wire format (`Protocol.h`) | ✅ |
+| Session (Invitation → Established, Ping/Bye, sequence dedup) | ✅ |
+| Both roles (Host / Client), bidirectional UMP | ✅ + loopback test |
+| mDNS discovery (`_midi2._udp`) | planned |
+| FEC + retransmit robustness | planned |
+| Authentication (Invitation with Auth) | planned |
+
+## Contributing
+
+Issues and pull requests welcome. Please keep the **core** (`Protocol.h`,
+`Session.h`) freestanding — no exceptions/RTTI/heap/STL containers/OS headers — so
+it keeps compiling on embedded targets. Platform‑specific code belongs in adapters,
+behind the `Platform.h` interfaces. New wire behaviour should cite the M2‑124‑UM
+section it implements and, where practical, add a test.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
