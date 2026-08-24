@@ -3,8 +3,7 @@
 A small, portable, dependency‑free **C++17 implementation of Network MIDI 2.0
 (UDP)** — the MIDI Association's UMP‑over‑UDP transport, spec **M2‑124‑UM**.
 
-<!-- Replace OWNER with your GitHub user/org once the repo is pushed. -->
-![CI](https://github.com/OWNER/libnetmidi2/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/nubbstone/libnetmidi2/actions/workflows/ci.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Send and receive **MIDI 2.0 Universal MIDI Packets over Ethernet/Wi‑Fi** with full

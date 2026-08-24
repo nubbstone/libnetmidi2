@@ -1,9 +1,6 @@
 # Network MIDI 2.0 (UDP) — wire contract
 
-This is the **shared wire contract** implemented by both ends of the link:
-
-- the **M2 SoundGen Host** (macOS, JUCE) — see `libnetmidi2` in this folder, and
-- the **Teensy / Zephyr** sister project (bare-metal Ethernet).
+This is the **shared wire contract** implemented by both ends of the link.
 
 It is a faithful profile of the MIDI Association specification
 **M2-124-UM "Network MIDI 2.0 (UDP)" v1.0 (2024-11-20)**. Section numbers below
