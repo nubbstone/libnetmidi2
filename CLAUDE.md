@@ -144,8 +144,8 @@ explicit `host:port`.
 
 ## Housekeeping / gotchas
 
-- **Placeholders to fill before publishing:** `LICENSE` has `<COPYRIGHT HOLDER>`;
-  `README.md`'s CI badge URL has `OWNER`. No git remote is configured yet (local repo).
+- **Placeholders:** `LICENSE` copyright holder and the README CI badge URL are set
+  (`nubbstone`). Remote: `github.com/nubbstone/libnetmidi2`.
 - **Comment hazard:** never write a `*/` inside a block comment (e.g. a path like
   `zsock_*/…`) — it closes the comment early. (Bitten once.)
 - The library must stay **buildable on its own** (this repo's CI proves it). If a
