@@ -141,7 +141,62 @@ int main()
         check (hostRec.umpCount==1, "duplicate sequence number ignored");
     }
 
-    // 5. Graceful close.
+    // 5. A lost InvitationAccepted must be recoverable.
+    //
+    // This is a regression test for a handshake that could deadlock permanently.
+    // The host used to accept an Invitation only while it was NOT established, so
+    // if its one Accepted went missing the client retried forever against a host
+    // that had already made up its mind. Nothing timed out either: the host kept
+    // receiving those retries and counted them as liveness. Seen in the field as a
+    // host reporting `established` with a peer whose client still said `inviting`,
+    // minutes later.
+    //
+    // Simulated by draining the client's socket after the host accepts, which
+    // discards the Accepted exactly as the network would have.
+    {
+        PosixUdp host2Sock, client2Sock;
+        std::uint16_t h2 = 0, c2 = 0;
+        host2Sock.bind (0, h2); client2Sock.bind (0, c2);
+        Platform h2Plat { &host2Sock, &clock, nullptr }, c2Plat { &client2Sock, &clock, nullptr };
+        Recorder h2Rec ("host2"), c2Rec ("client2");
+        Session h2s (h2Plat, Role::host,   &h2Rec, "Lossy Host",   "LOSSY-HOST-1");
+        Session c2s (c2Plat, Role::client, &c2Rec, "Lossy Client", "LOSSY-CLIENT-1");
+
+        h2s.listen();
+        Endpoint h2Ep {}; std::strcpy (h2Ep.address, "127.0.0.1"); h2Ep.port = h2;
+        c2s.connect (h2Ep);
+
+        // Let the host accept, but never let the client tick -- so the Accepted is
+        // still sitting in its socket, unread.
+        for (int i = 0; i < 200 && h2s.state() != State::established; ++i) { h2s.tick(); usleep (1000); }
+        check (h2s.state()==State::established, "lost-accept: host accepted");
+
+        // Drop it on the floor.
+        { std::uint8_t junk[2048]; Endpoint from; while (client2Sock.receive (junk, sizeof junk, from) > 0) {} }
+        check (c2s.state()==State::inviting, "lost-accept: client left inviting (the deadlock)");
+
+        // The client retries every inviteRetryMs (500). An established host must
+        // answer that retry instead of ignoring it.
+        for (int i = 0; i < 3000 && c2s.state() != State::established; ++i)
+        { h2s.tick(); c2s.tick(); usleep (1000); }
+        check (c2s.state()==State::established, "lost-accept: client recovers on retry");
+
+        // ...but a DIFFERENT endpoint must not be able to take the session away.
+        {
+            PosixUdp intruder; std::uint16_t ip = 0; intruder.bind (0, ip);
+            const Endpoint before = h2s.remote();
+            std::uint8_t buf[128]; Writer w (buf, sizeof buf);
+            const char *iname = "Intruder", *ipid = "INTRUDER-1";
+            w.writeSignature();
+            writeInvitation (w, 0, iname, std::strlen (iname), ipid, std::strlen (ipid));
+            intruder.send (h2Ep, buf, w.size());
+            for (int i = 0; i < 50; ++i) { h2s.tick(); usleep (1000); }
+            check (h2s.state()==State::established && h2s.remote() == before,
+                   "lost-accept: a different endpoint cannot steal the session");
+        }
+    }
+
+    // 6. Graceful close.
     client.close(); pump (50);
     check (host.state()==State::closed && client.state()==State::closed, "graceful Bye -> both Closed");
 

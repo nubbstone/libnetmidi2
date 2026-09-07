@@ -135,11 +135,38 @@ private:
         switch (c.code)
         {
             case Command::invitation:
-                if (role == Role::host && st != State::established)
+                if (role != Role::host)
+                    break;
+
+                if (st != State::established)
                 {
                     peer = from;
                     sendInvitationAccepted();
                     setState (State::established);
+                }
+                else if (from == peer)
+                {
+                    /* Already established with this same peer, and it is still
+                     * inviting -- so our InvitationAccepted never arrived. Send it
+                     * again.
+                     *
+                     * Without this the handshake is unrecoverable in one specific
+                     * way: a host that ignores repeat Invitations leaves the client
+                     * retrying forever against a peer that considers the session
+                     * open. The two ends disagree permanently, the host shows
+                     * `established` and the client shows `inviting`, and nothing
+                     * times out because the host keeps hearing the invitations and
+                     * treats them as liveness. Observed between two Raspberry Pis:
+                     * host established with 192.168.2.134:47605 while the client
+                     * owning that very port still reported `inviting`, minutes
+                     * later.
+                     *
+                     * Accepting is idempotent, so re-answering costs one datagram
+                     * per client retry and converges as soon as one gets through.
+                     * An Invitation from a DIFFERENT endpoint is still ignored: one
+                     * session carries one peer, and answering a second would silently
+                     * steal the session from the box already using it. */
+                    sendInvitationAccepted();
                 }
                 break;
 
