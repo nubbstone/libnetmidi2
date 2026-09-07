@@ -203,8 +203,31 @@ private:
                 setState (State::closed);
                 break;
 
+            case Command::nak:
+                // The peer rejected something we sent under the assumption that we
+                // were Established -- almost always UMP_DATA after the peer
+                // restarted and has no record of us. This is the client's ONLY
+                // reliable signal that has happened: our own idle-timeout cannot
+                // catch it, because a peer that answers Ping unconditionally
+                // (session-independent, e.g. Zephyr's netmidi2.c) keeps refreshing
+                // touch() forever even with no session at all. Measured against
+                // the Teensy: a NAK arrived for every rejected UMP_DATA, but sat in
+                // the "Phase 1: ignore" default case, so the client stayed
+                // `established` and kept sending into the void indefinitely.
+                //
+                // Re-inviting is safe even if the NAK was actually about
+                // something else (host role sends none today, so in practice this
+                // only fires for a client): worst case is one extra, harmless
+                // handshake round-trip.
+                if (role == Role::client && st == State::established)
+                {
+                    setState (State::idle);
+                    connect (peer);
+                }
+                break;
+
             default:
-                break; // NAK / unhandled — ignore for Phase 1
+                break; // unhandled — ignore for Phase 1
         }
     }
 

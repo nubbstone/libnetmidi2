@@ -196,7 +196,89 @@ int main()
         }
     }
 
-    // 6. Graceful close.
+    // 6. NAK recovery: a peer that forgot our session must be recoverable
+    // automatically, not just by an application restarting the connection by
+    // hand.
+    //
+    // This is the bug measured against the Teensy. Our client stayed
+    // `established` forever because the peer answers Ping unconditionally, with
+    // no session check at all -- so touch() kept resetting our idle timer even
+    // after the peer had no memory of us (e.g. after it rebooted). The peer DOES
+    // still send a NAK for the UMP_DATA it rejects (Zephyr's netmidi2.c does;
+    // Session.h's own host role does not yet -- a separate, smaller gap). That
+    // NAK is concrete proof the session died, and used to fall into the
+    // "Phase 1: ignore" default case.
+    //
+    // No Session plays the host role here: a raw socket stands in for "a peer
+    // that no longer runs the protocol on our behalf", which is exactly what a
+    // rebooted host is from the client's point of view.
+    {
+        PosixUdp rawHost, client3Sock;
+        std::uint16_t rhPort = 0, c3Port = 0;
+        rawHost.bind (0, rhPort); client3Sock.bind (0, c3Port);
+        Platform c3Plat { &client3Sock, &clock, nullptr };
+        Recorder c3Rec ("client3");
+        Session client3 (c3Plat, Role::client, &c3Rec, "Nak Client", "NAK-CLIENT-1");
+
+        Endpoint rhEp {}; std::strcpy (rhEp.address, "127.0.0.1"); rhEp.port = rhPort;
+        client3.connect (rhEp);
+
+        // Waits specifically for an Invitation, ignoring anything else the client
+        // sends meanwhile (its periodic Ping, in particular) -- otherwise this
+        // would "succeed" by answering the wrong packet and mask a client that
+        // never actually re-invited.
+        auto answerNextInvitation = [&] (const char* label) -> bool {
+            for (int i = 0; i < 500; ++i)
+            {
+                std::uint8_t inbuf[512]; Endpoint from;
+                const int n = rawHost.receive (inbuf, sizeof inbuf, from);
+                bool gotInvitation = false;
+                if (n > 0)
+                    parseDatagram (inbuf, std::size_t (n), [&] (const ParsedCommand& c) {
+                        if (c.code == Command::invitation) gotInvitation = true;
+                    });
+                if (gotInvitation)
+                {
+                    check (true, label);
+                    std::uint8_t buf[128]; Writer w (buf, sizeof buf);
+                    const char *n_ = "Raw Host", *p_ = "RAW-HOST-1";
+                    w.writeSignature();
+                    writeInvitationAccepted (w, n_, std::strlen (n_), p_, std::strlen (p_));
+                    rawHost.send (from, buf, w.size());
+                    return true;
+                }
+                client3.tick(); usleep (1000);
+            }
+            check (false, label);
+            return false;
+        };
+
+        answerNextInvitation ("nak-recovery: raw host saw the Invitation");
+        for (int i = 0; i < 500 && client3.state() != State::established; ++i) { client3.tick(); usleep (1000); }
+        check (client3.state()==State::established, "nak-recovery: client established against raw host");
+
+        // The "host" now rejects everything, as if it restarted and forgot us.
+        std::uint32_t noteOn2[2] = { 0x40903C00u, 0xFFFF0000u };
+        client3.sendUmp (noteOn2, 2);
+        {
+            std::uint8_t inbuf[512]; Endpoint from; int n = 0;
+            for (int i = 0; i < 200 && n <= 0; ++i)
+            { n = rawHost.receive (inbuf, sizeof inbuf, from); if (n<=0) usleep (1000); }
+            check (n > 0, "nak-recovery: raw host saw the stray UMP_DATA");
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); w.writeHeader (Command::nak, 0, 0);
+            if (n > 0) rawHost.send (from, buf, w.size());
+        }
+
+        for (int i = 0; i < 200 && client3.state() != State::inviting; ++i) { client3.tick(); usleep (1000); }
+        check (client3.state()==State::inviting, "nak-recovery: client re-invites after a NAK");
+
+        answerNextInvitation ("nak-recovery: raw host saw the fresh Invitation");
+        for (int i = 0; i < 500 && client3.state() != State::established; ++i) { client3.tick(); usleep (1000); }
+        check (client3.state()==State::established, "nak-recovery: client re-established");
+    }
+
+    // 7. Graceful close.
     client.close(); pump (50);
     check (host.state()==State::closed && client.state()==State::closed, "graceful Bye -> both Closed");
 
