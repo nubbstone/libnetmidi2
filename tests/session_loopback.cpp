@@ -278,7 +278,115 @@ int main()
         check (client3.state()==State::established, "nak-recovery: client re-established");
     }
 
-    // 7. Graceful close.
+    // 7. A third party cannot operate on a session it is not part of.
+    //
+    // The established host/client pair from step 1 is still up. A raw socket that
+    // has never been invited now sends the three things that used to be acted on
+    // regardless of who sent them. Each one used to be a real hole:
+    //   Bye      -> closed somebody else's session outright. One 8-byte datagram,
+    //               from anywhere on the LAN. This is what made a restart appear
+    //               to "fix" a stuck client: the parting Bye of the restarting
+    //               session freed the host slot by evicting the box using it.
+    //   UMP_DATA -> was delivered to the listener as if the peer had sent it,
+    //               i.e. anyone could inject notes into a running MIDI session.
+    //   Ping     -> was answered, and (worse) refreshed the liveness timer, so a
+    //               peer that had actually gone away still looked present.
+    {
+        PosixUdp stranger;
+        std::uint16_t sPort = 0;
+        check (stranger.bind (0, sPort), "stranger: raw socket bound");
+        /* hostEp (declared above) already addresses the host from step 1. */
+
+        check (host.state()==State::established && client.state()==State::established,
+               "stranger: pair is established to begin with");
+
+        auto sendRaw = [&] (void (*build) (Writer&)) {
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); build (w);
+            stranger.send (hostEp, buf, w.size());
+        };
+
+        const int hostRxBefore = hostRec.umpCount;
+
+        /* Order matters: the Bye goes LAST. Sent first it would close the session,
+         * and the UMP and Ping checks below would then pass for the wrong reason
+         * -- rejected as "no session" rather than as "not your session". */
+        {
+            std::uint32_t spoof[2] = { 0x40903C00u, 0xFFFF0000u };
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); writeUmpData (w, 0x4242, spoof, 2);
+            stranger.send (hostEp, buf, w.size());
+        }
+        pump (30);
+        check (hostRec.umpCount == hostRxBefore, "stranger: UMP_DATA is NOT delivered");
+        check (host.state()==State::established, "stranger: still established after stray UMP");
+
+        sendRaw ([] (Writer& w) { writePing (w, 0x99u); });
+        pump (30);
+        {
+            std::uint8_t in[128]; Endpoint from;
+            check (stranger.receive (in, sizeof in, from) <= 0,
+                   "stranger: Ping into an established session is NOT answered");
+        }
+
+        sendRaw ([] (Writer& w) { writeBye (w, ByeReason::undefined); });
+        pump (30);
+        check (host.state()==State::established, "stranger: Bye does NOT close the session");
+
+        // ...and the legitimate peer is completely unaffected by all of it.
+        std::uint32_t real[2] = { 0x40B04A00u, 0x80000000u };
+        const int cliBefore = clientRec.umpCount;
+        host.sendUmp (real, 2);
+        pump (50);
+        check (clientRec.umpCount == cliBefore + 1, "stranger: real peer still flows afterwards");
+    }
+
+    // 7b. A stranger's traffic must not keep a dead session looking alive.
+    //
+    // The other half of the sender check, and the subtler half. Liveness used to
+    // be refreshed by ANY datagram from ANY source, so a box that pinged a host it
+    // was not in session with would hold that host's timeout open indefinitely --
+    // the real peer could be switched off and unplugged and the host would never
+    // notice. (This is precisely the pathology the NAK fix above documents on the
+    // Zephyr side; this library had its own version of it.)
+    //
+    // Short timeout so the test costs a second, not ten.
+    {
+        PosixUdp h4Sock, c4Sock, nosy;
+        std::uint16_t h4 = 0, c4 = 0, n4 = 0;
+        h4Sock.bind (0, h4); c4Sock.bind (0, c4); nosy.bind (0, n4);
+        Platform h4Plat { &h4Sock, &clock, nullptr }, c4Plat { &c4Sock, &clock, nullptr };
+        Recorder h4Rec ("host4"), c4Rec ("client4");
+        Session h4s (h4Plat, Role::host,   &h4Rec, "Timeout Host",   "TO-HOST-1");
+        Session c4s (c4Plat, Role::client, &c4Rec, "Timeout Client", "TO-CLIENT-1");
+
+        Session::Timing fast; fast.timeoutMs = 400; fast.pingIntervalMs = 100000;
+        h4s.setTiming (fast);
+
+        h4s.listen();
+        Endpoint h4Ep {}; std::strcpy (h4Ep.address, "127.0.0.1"); h4Ep.port = h4;
+        c4s.connect (h4Ep);
+        for (int i = 0; i < 500 && h4s.state() != State::established; ++i)
+        { h4s.tick(); c4s.tick(); usleep (1000); }
+        check (h4s.state()==State::established, "liveness: established before the peer vanishes");
+
+        // The real client now goes silent (never ticked again), while the nosy box
+        // pings steadily. Only the silence should count.
+        for (int i = 0; i < 800 && h4s.state() == State::established; ++i)
+        {
+            if (i % 50 == 0)
+            {
+                std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+                w.writeSignature(); writePing (w, 0x77u);
+                nosy.send (h4Ep, buf, w.size());
+            }
+            h4s.tick(); usleep (1000);
+        }
+        check (h4s.state()==State::closed,
+               "liveness: host still times out despite a stranger's pings");
+    }
+
+    // 8. Graceful close.
     client.close(); pump (50);
     check (host.state()==State::closed && client.state()==State::closed, "graceful Bye -> both Closed");
 
