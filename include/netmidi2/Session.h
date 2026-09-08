@@ -131,7 +131,42 @@ private:
 
     void handleCommand (const ParsedCommand& c, const Endpoint& from) noexcept
     {
-        touch();
+        /* Everything that belongs to a session must come FROM that session's peer.
+         * Without this check any box on the LAN can operate on a session it is not
+         * part of: one spoofed 8-byte Bye closes somebody else's session, stray
+         * UMP_DATA is delivered as if the peer had sent it, and a stranger's
+         * traffic refreshes the liveness timer so a peer that is really gone goes
+         * on looking alive.
+         *
+         * Measured on the bench, and the reason this was found: a client stuck at
+         * `inviting` against a host that was busy with a third box would connect
+         * the moment its own router was RESTARTED. The restart was not fixing the
+         * handshake -- the parting Bye of the closing session was knocking the
+         * innocent third party off that host, freeing the one slot. "Restart it
+         * and it connects" looked like flakiness; it was this.
+         *
+         * Two things may still arrive from anywhere. An Invitation, because that
+         * is how a peer is learned in the first place (one aimed at a session that
+         * is already established is still ignored below). And a Ping while no
+         * session is at stake, which peers use to probe liveness before inviting
+         * -- answering that costs nothing and refusing it would make an idle host
+         * look dead. */
+        const bool fromPeer = (st == State::inviting || st == State::established)
+                              && from == peer;
+        const bool sessionless = (st == State::idle || st == State::closed);
+
+        if (! fromPeer
+            && c.code != Command::invitation
+            && ! (sessionless && c.code == Command::ping))
+            return;
+
+        /* Only our actual peer keeps the session alive. Notably this excludes an
+         * Invitation from a stranger to an established session: it is allowed
+         * through (to be ignored), but it must not renew the timer that is the
+         * only thing telling us the real peer went away. */
+        if (fromPeer || sessionless)
+            touch();
+
         switch (c.code)
         {
             case Command::invitation:
