@@ -137,9 +137,7 @@ explicit `host:port`.
 ## Reference material
 
 - MIDI Association **M2‑124‑UM "Network MIDI 2.0 (UDP)" v1.0 (2024‑11‑20)** — the
-  normative spec. A local copy is at
-  `~/MyDrive/books/_NONFICTION_/Music protocols/MIDI/midi2/M2-124-UM_v1-0_Network-MIDI-2-0-UDP.pdf`
-  (read PDFs with `pdftotext -layout` — `brew install poppler` if missing).
+  normative spec. 
 - Public overview: https://midi.org/network-midi-2-0-udp-overview
 
 ## Housekeeping / gotchas
