@@ -654,6 +654,132 @@ int main()
         check (clientRec.umpCount == cliBefore + 1, "dup-accept: UMP still flows afterwards");
     }
 
+    // 7f. FEC repeats must be recognised as already-seen.
+    //
+    // §7.2: "Receivers ignore UMP Data Commands with a Sequence Number which has
+    // already been received and processed", and §7.2.2 makes it a receiver shall:
+    // "Every Device receiving a UDP packet with UMP data shall be able to skip
+    // previously received UMP Data Commands."
+    //
+    // Remembering only the newest Sequence Number failed this completely. A FEC
+    // sender prepends its previous commands oldest-first, so datagram N carries
+    // [N-2, N-1, N]; compared against the newest alone, N-2 does not match, gets
+    // re-delivered, AND drags the marker backwards so N-1 misses too. Measured
+    // against a standard two-repeat sender before the fix: every message delivered
+    // three times -- every note-on fired three times, every CC applied three times.
+    // It had not been noticed only because the Teensy does not send FEC yet.
+    {
+        PosixUdp fecHostSock, fecPeer;
+        std::uint16_t fhPort = 0, fpPort = 0;
+        check (fecHostSock.bind (0, fhPort) && fecPeer.bind (0, fpPort), "fec: sockets bound");
+
+        Platform fhPlat { &fecHostSock, &clock, nullptr };
+        Recorder fhRec ("fechost");
+        Session fecHost (fhPlat, Role::host, &fhRec, "FEC Host", "FEC-HOST-1");
+        fecHost.listen();
+
+        Endpoint fhEp {}; std::strcpy (fhEp.address, "127.0.0.1"); fhEp.port = fhPort;
+        {
+            std::uint8_t b[16]; Writer w (b, sizeof b);
+            w.writeSignature(); w.writeHeader (Command::invitation, 0, 0);
+            fecPeer.send (fhEp, b, w.size());
+        }
+        for (int i = 0; i < 100 && fecHost.state() != State::established; ++i)
+        { fecHost.tick(); usleep (1000); }
+        check (fecHost.state()==State::established, "fec: established");
+
+        // One datagram carrying these Sequence Numbers, oldest first (FEC order).
+        auto sendFec = [&] (const std::uint16_t* seqs, int n) {
+            std::uint8_t b[kMaxDatagram]; Writer w (b, sizeof b);
+            w.writeSignature();
+            for (int i = 0; i < n; ++i)
+            {
+                const std::uint32_t ump[2] = { 0x40904000u | std::uint32_t (seqs[i] & 0xFFu),
+                                               0x11110000u };
+                writeUmpData (w, seqs[i], ump, 2);
+            }
+            fecPeer.send (fhEp, b, w.size());
+            for (int i = 0; i < 30; ++i) { fecHost.tick(); usleep (500); }
+        };
+
+        // --- steady state: five messages, each repeated twice by FEC -----------
+        int mark = fhRec.umpCount;
+        { std::uint16_t s[] = {1};       sendFec (s, 1); }
+        { std::uint16_t s[] = {1,2};     sendFec (s, 2); }
+        { std::uint16_t s[] = {1,2,3};   sendFec (s, 3); }
+        { std::uint16_t s[] = {2,3,4};   sendFec (s, 3); }
+        { std::uint16_t s[] = {3,4,5};   sendFec (s, 3); }
+        check (fhRec.umpCount - mark == 5,
+               "fec: 5 distinct messages delivered exactly once each (was 3x each)");
+
+        // --- FEC does its job: a lost datagram is recovered from the next ------
+        // The datagram whose newest command was seq 6 never arrives. Its content
+        // comes back as a repeat inside the following one, and must be DELIVERED --
+        // that recovery is the entire point of FEC, so "not the newest" can never
+        // by itself be a reason to discard.
+        mark = fhRec.umpCount;
+        { std::uint16_t s[] = {5,6,7};   sendFec (s, 3); }
+        check (fhRec.umpCount - mark == 2, "fec: a dropped datagram is recovered (6 and 7)");
+
+        // --- an old duplicate still inside the window is ignored ---------------
+        mark = fhRec.umpCount;
+        { std::uint16_t s[] = {3};       sendFec (s, 1); }
+        check (fhRec.umpCount - mark == 0, "fec: an older, already-seen seq is ignored");
+
+        // --- something far older than the window remembers is ignored ----------
+        mark = fhRec.umpCount;
+        { std::uint16_t s[] = {0xFF00};  sendFec (s, 1); }   // ~250 behind
+        check (fhRec.umpCount - mark == 0, "fec: a seq older than the window is ignored");
+
+        // --- the session still works normally afterwards -----------------------
+        mark = fhRec.umpCount;
+        { std::uint16_t s[] = {8};       sendFec (s, 1); }
+        check (fhRec.umpCount - mark == 1, "fec: a genuinely new seq still arrives");
+    }
+
+    // 7g. Sequence numbers wrap at 0xFFFF (§5.6) — the window must wrap with them.
+    {
+        PosixUdp wrapHostSock, wrapPeer;
+        std::uint16_t whPort = 0, wpPort = 0;
+        wrapHostSock.bind (0, whPort); wrapPeer.bind (0, wpPort);
+
+        Platform whPlat { &wrapHostSock, &clock, nullptr };
+        Recorder whRec ("wraphost");
+        Session wrapHost (whPlat, Role::host, &whRec, "Wrap Host", "WRAP-HOST-1");
+        wrapHost.listen();
+
+        Endpoint whEp {}; std::strcpy (whEp.address, "127.0.0.1"); whEp.port = whPort;
+        {
+            std::uint8_t b[16]; Writer w (b, sizeof b);
+            w.writeSignature(); w.writeHeader (Command::invitation, 0, 0);
+            wrapPeer.send (whEp, b, w.size());
+        }
+        for (int i = 0; i < 100 && wrapHost.state() != State::established; ++i)
+        { wrapHost.tick(); usleep (1000); }
+
+        auto sendWrap = [&] (const std::uint16_t* seqs, int n) {
+            std::uint8_t b[kMaxDatagram]; Writer w (b, sizeof b);
+            w.writeSignature();
+            for (int i = 0; i < n; ++i)
+            {
+                const std::uint32_t ump[2] = { 0x40905000u, 0x22220000u };
+                writeUmpData (w, seqs[i], ump, 2);
+            }
+            wrapPeer.send (whEp, b, w.size());
+            for (int i = 0; i < 30; ++i) { wrapHost.tick(); usleep (500); }
+        };
+
+        const int mark = whRec.umpCount;
+        { std::uint16_t s[] = {0xFFFE};                 sendWrap (s, 1); }
+        { std::uint16_t s[] = {0xFFFE, 0xFFFF, 0x0000}; sendWrap (s, 3); }
+        { std::uint16_t s[] = {0xFFFF, 0x0000, 0x0001}; sendWrap (s, 3); }
+
+        // 0xFFFE, 0xFFFF, 0x0000, 0x0001 — four distinct, and the repeats across
+        // the wrap boundary must be seen as repeats, not as a 65535-packet jump.
+        check (whRec.umpCount - mark == 4,
+               "wrap: 0xFFFE->0x0001 delivers 4 distinct, repeats still deduplicated");
+    }
+
     // 8. Graceful close.
     client.close(); pump (50);
     check (host.state()==State::closed && client.state()==State::closed, "graceful Bye -> both Closed");
