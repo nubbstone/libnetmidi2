@@ -111,6 +111,19 @@ public:
         : data (buffer), cap (capacity) {}
 
     std::size_t size() const noexcept { return len; }
+
+    /*  True until some write did not fit. Every write also returns a bool, so this
+        is a second, sticky channel for the same fact, and it earns its place twice:
+
+        - It allows build-then-check for a datagram assembled from several commands,
+          instead of threading a bool through each one. FEC (§7.2.2) packs repeated
+          UMP Data commands into one datagram and will want exactly that.
+
+        - It is the backstop. `overflowed` is set inside raw(), so a builder that
+          forgets to propagate a failed write still cannot produce a datagram that
+          passes this. Session's send paths check it last, so a truncated packet
+          cannot reach the wire even if a future builder is careless.
+    */
     bool        ok()   const noexcept { return ! overflowed; }
 
     // A datagram must open with the signature exactly once (§5.2).
@@ -171,35 +184,46 @@ inline bool writeUmpData (Writer& w, std::uint16_t sequenceNumber,
     return true;
 }
 
-// Invitation (§6.4). name/productId are UTF-8/ASCII, not necessarily word-aligned;
-// they are null-padded to word boundaries here.
-inline bool writeInvitation (Writer& w, std::uint8_t capabilities,
-                             const char* name, std::size_t nameLen,
-                             const char* productId, std::size_t productLen) noexcept
+/*  Several commands carry the same payload: a UMP Endpoint Name followed by a
+    Product Instance Id, with csd1 = the name's length in 32-bit words. Invitation
+    (§6.4 Table 10) and Invitation Reply: Accepted (§6.5 Table 12) are structurally
+    identical; they differ only in the command code and in what csd2 means --
+    Capabilities for the Invitation, Reserved (0) for the Reply. Invitation Reply:
+    Pending (§6.6) has the same shape again when it arrives.
+
+    Strings are UTF-8 (name) / ASCII (product id), not necessarily word-aligned;
+    each is null-padded up to a word boundary here (§5.3).
+*/
+inline bool writeEndpointIdentity (Writer& w, Command code, std::uint8_t csd2,
+                                   const char* name, std::size_t nameLen,
+                                   const char* productId, std::size_t productLen) noexcept
 {
     const std::uint8_t nameWords    = std::uint8_t ((nameLen    + 3) / 4);
     const std::uint8_t productWords = std::uint8_t ((productLen + 3) / 4);
     const std::uint8_t payloadWords = std::uint8_t (nameWords + productWords);
-    const std::uint16_t csd = std::uint16_t ((std::uint16_t (nameWords) << 8) | capabilities);
+    const std::uint16_t csd = std::uint16_t ((std::uint16_t (nameWords) << 8) | csd2);
 
-    return w.writeHeader (Command::invitation, payloadWords, csd)
+    return w.writeHeader (code, payloadWords, csd)
         && w.bytesPadded (name, nameLen)
         && w.bytesPadded (productId, productLen);
 }
 
-// Invitation Reply: Accepted (§6.5).
+// Invitation (§6.4). csd2 is the Capabilities bitmap (Table 11).
+inline bool writeInvitation (Writer& w, std::uint8_t capabilities,
+                             const char* name, std::size_t nameLen,
+                             const char* productId, std::size_t productLen) noexcept
+{
+    return writeEndpointIdentity (w, Command::invitation, capabilities,
+                                  name, nameLen, productId, productLen);
+}
+
+// Invitation Reply: Accepted (§6.5). csd2 is Reserved and shall be 0 (Table 12).
 inline bool writeInvitationAccepted (Writer& w,
                                      const char* name, std::size_t nameLen,
                                      const char* productId, std::size_t productLen) noexcept
 {
-    const std::uint8_t nameWords    = std::uint8_t ((nameLen    + 3) / 4);
-    const std::uint8_t productWords = std::uint8_t ((productLen + 3) / 4);
-    const std::uint8_t payloadWords = std::uint8_t (nameWords + productWords);
-    const std::uint16_t csd = std::uint16_t (std::uint16_t (nameWords) << 8);
-
-    return w.writeHeader (Command::invitationReplyAccepted, payloadWords, csd)
-        && w.bytesPadded (name, nameLen)
-        && w.bytesPadded (productId, productLen);
+    return writeEndpointIdentity (w, Command::invitationReplyAccepted, 0,
+                                  name, nameLen, productId, productLen);
 }
 
 inline bool writePing (Writer& w, std::uint32_t pingId) noexcept
