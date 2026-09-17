@@ -155,7 +155,7 @@ private:
      * party off that host, freeing the one slot. "Restart it and it connects"
      * looked like flakiness; it was this.
      *
-     * Three things may still arrive from anywhere, and each is answered without
+     * Four things may still arrive from anywhere, and each is answered without
      * being accepted -- the handler decides what, if anything, it does to our
      * session:
      *
@@ -168,6 +168,11 @@ private:
      *   know nothing about is exactly the one stuck retransmitting. onBye
      *   acknowledges every Bye but closes only for our own peer.
      *
+     *   Invitation Reply: Accepted, because §6.5 requires Bye 0x06 when there is no
+     *   pending invitation -- which by definition means it did not come from a peer
+     *   we are mid-handshake with. onInvitationAccepted establishes ONLY for the
+     *   endpoint we actually invited; for anyone else it just answers.
+     *
      *   Ping while no session is at stake, which peers use to probe liveness before
      *   inviting -- answering costs nothing and refusing would make an idle host
      *   look dead. */
@@ -175,7 +180,9 @@ private:
     {
         if (fromPeer)
             return true;
-        if (code == Command::invitation || code == Command::bye)
+        if (code == Command::invitation
+            || code == Command::bye
+            || code == Command::invitationReplyAccepted)
             return true;
         return sessionless && code == Command::ping;
     }
@@ -257,7 +264,7 @@ private:
         switch (c.code)
         {
             case Command::invitation:              onInvitation (from);    break;
-            case Command::invitationReplyAccepted: onInvitationAccepted(); break;
+            case Command::invitationReplyAccepted: onInvitationAccepted (from, fromPeer); break;
             case Command::ping:                    onPing (c, from);       break;
             case Command::pingReply:               break; // liveness already refreshed
             case Command::umpData:                 onUmpData (c);          break;
@@ -303,10 +310,37 @@ private:
             sendInvitationAccepted();
     }
 
-    void onInvitationAccepted() noexcept
+    void onInvitationAccepted (const Endpoint& from, bool fromPeer) noexcept
     {
-        if (role == Role::client && st == State::inviting)
+        // The normal case: our own pending invitation was accepted.
+        if (fromPeer && role == Role::client && st == State::inviting)
+        {
             setState (State::established);
+            return;
+        }
+
+        /* §6.5: "If a Client receives this Command when it is already in an
+         * Established Session with the Host, then it shall ignore it."
+         *
+         * This branch must come before the Bye below, and is the reason the order
+         * matters: a host repeats its Accepted until it sees traffic (see
+         * onInvitation), so a duplicate arriving just after we established is
+         * routine. Answering that with a Bye would tear down the session we just
+         * successfully opened, using the host's own retransmission to do it. */
+        if (fromPeer && st == State::established)
+            return;
+
+        /* §6.5: "If a Client receives this Command when it is not in a Pending
+         * Session with the Host, then the Client shall send a Bye Command to the
+         * Host with reason 0x06 (No Pending Invitation)."
+         *
+         * We have no invitation outstanding with this sender -- we never sent one,
+         * or we have since given up or closed. Either way the sender believes it is
+         * opening a session that does not exist on our side, and will go on
+         * retransmitting until told. Note this deliberately does NOT establish
+         * anything: an Accepted from an endpoint we did not invite must never open a
+         * session, or anyone on the LAN could hand us one unasked. */
+        sendByeTo (from, ByeReason::noPendingInvitation);
     }
 
     void onPing (const ParsedCommand& c, const Endpoint& from) noexcept
