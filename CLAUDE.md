@@ -122,7 +122,8 @@ Three suites:
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
   NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, the §7.1 /
-  §5.5 replies owed to a sender we have no session with, liveness timeout, graceful
+  §5.5 replies owed to a sender we have no session with, FEC repeats deduplicated
+  across a 64‑entry window (including the `0xFFFF` wrap), liveness timeout, graceful
   Bye → Closed.
 
 **Replying vs accepting.** Several things are answered regardless of who sent them —

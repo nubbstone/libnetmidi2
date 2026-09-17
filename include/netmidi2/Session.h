@@ -355,26 +355,93 @@ private:
             sendOneTo (from, [id = get32 (c.payload)] (Writer& w) { return writePingReply (w, id); });
     }
 
+    /*  Has this Sequence Number already been processed? Records it if not.
+
+        §7.2 makes this a receiver's job, not an optional optimisation: "Receivers
+        ignore UMP Data Commands with a Sequence Number which has already been
+        received and processed", and §7.2.2 "Every Device receiving a UDP packet
+        with UMP data shall be able to skip previously received UMP Data Commands."
+
+        Remembering only the newest Sequence Number is not enough, which is the bug
+        this replaced. A FEC sender prepends its previous commands oldest-first
+        (§7.2.2 "FEC Packet Order"), so a datagram carries [N-2, N-1, N]. Compared
+        against the newest alone, N-2 does not match, gets delivered a second time,
+        AND drags the newest marker backwards so N-1 fails to match either. Measured
+        against a standard two-repeat sender: every message delivered three times --
+        every note-on fired three times.
+
+        So: a 64-entry replay window, the same shape IPsec uses. `lastRx` is the
+        highest Sequence Number processed and `rxWindow` bit i means (lastRx - i)
+        has been processed, bit 0 being lastRx itself. All comparisons are in 16-bit
+        wrapping arithmetic, so 0xFFFF -> 0x0000 needs no special case (§5.6), and a
+        sender that restarts its numbering simply jumps the window forward.
+
+        Note what this deliberately does NOT do: it does not hold packets back to
+        put them in order. An unseen Sequence Number is delivered whatever its
+        position, because that is exactly how FEC repairs a gap -- the missing
+        command arrives inside a LATER datagram, and refusing it for being out of
+        order would throw away the recovery FEC exists to provide. The cost is that
+        a repaired message reaches the listener after ones that followed it.
+        Reordering with a jitter buffer belongs above this layer.
+    */
+    static constexpr std::uint16_t kRxWindowBits = 64;
+
+    bool acceptSequence (std::uint16_t seq) noexcept
+    {
+        if (! haveRx)
+        {
+            haveRx   = true;
+            lastRx   = seq;
+            rxWindow = 1;
+            return true;
+        }
+
+        const std::uint16_t ahead = std::uint16_t (seq - lastRx);   // wraps at 0xFFFF
+
+        if (ahead == 0)
+            return false;                       // the newest one, again
+
+        if (ahead < 0x8000u)                    // newer: slide the window forward
+        {
+            rxWindow = (ahead >= kRxWindowBits) ? std::uint64_t (0)
+                                                : std::uint64_t (rxWindow << ahead);
+            rxWindow |= std::uint64_t (1);
+            lastRx = seq;
+            return true;
+        }
+
+        const std::uint16_t behind = std::uint16_t (lastRx - seq);  // 1..0x7FFF
+        if (behind >= kRxWindowBits)
+            return false;                       // older than the window remembers
+
+        const std::uint64_t bit = std::uint64_t (1) << behind;
+        if ((rxWindow & bit) != 0)
+            return false;                       // already processed
+
+        rxWindow |= bit;
+        return true;
+    }
+
     void onUmpData (const ParsedCommand& c) noexcept
     {
         /* Payload Length is one byte off the wire, so it can claim up to 255 words
          * -- but §7.1 Table 29 bounds a UMP Data command at 64. A command over that
          * is malformed by definition; drop it rather than hand a 255-word count to a
          * 64-word buffer. (Found by asking why this length was never range-checked
-         * on the way in when writeUmpData has always checked it on the way out.) */
-        if (st != State::established
-            || c.payloadWords == 0
-            || c.payloadWords > kMaxUmpWordsPerCommand
-            || ! c.payload)
+         * on the way in when writeUmpData has always checked it on the way out.)
+         * Rejected before the window sees it, so a malformed command cannot burn a
+         * Sequence Number that the real one still needs. */
+        if (st != State::established || c.payloadWords > kMaxUmpWordsPerCommand)
             return;
 
-        const std::uint16_t seq = c.cmdSpecific;
-        if (haveRx && seq == lastRx)        // ignore exact duplicate
+        /* Zero-length UMP Data carries a Sequence Number like any other (§7.2.1), so
+         * the window must see it even though there is nothing to hand over -- it is
+         * how a sender declares an idle period, and it is FEC-repeated too. */
+        if (! acceptSequence (c.cmdSpecific))
             return;
 
-        haveRx = true;
-        lastRx = seq;
-        deliverUmp (c.payload, c.payloadWords);
+        if (c.payloadWords > 0 && c.payload)
+            deliverUmp (c.payload, c.payloadWords);
     }
 
     void onBye (const Endpoint& from, bool fromPeer) noexcept
@@ -500,7 +567,8 @@ private:
 
     std::uint16_t     txSeq = 0;
     bool              haveRx = false;
-    std::uint16_t     lastRx = 0;
+    std::uint16_t     lastRx = 0;      // highest Sequence Number processed
+    std::uint64_t     rxWindow = 0;    // bit i => (lastRx - i) already processed
 
     std::uint32_t     lastRxMs = 0, lastPingMs = 0, lastInviteMs = 0, pingId = 0;
 };

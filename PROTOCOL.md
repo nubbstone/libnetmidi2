@@ -272,13 +272,40 @@ mDNS exists, allow an **explicit `host:port`** override on both ends.
 ## 5. Data-integrity (§7.2) — phased
 
 - **Dedup:** ignore a UMP Data command whose Sequence Number was already processed.
-- **Order:** track last seq; reorder/accept per §7.2.
-- **FEC (Phase 2):** repeat recent UMP Data commands within later datagrams for
-  redundancy (§7.2.2).
+  This is a **receiver `shall`**, not an optimisation (§7.2, and §7.2.2: "Every
+  Device receiving a UDP packet with UMP data shall be able to skip previously
+  received UMP Data Commands").
+- **FEC — receiving is Phase 1, sending is Phase 2.** Senders "should" repeat their
+  previous UMP Data commands inside later datagrams (§7.2.2); *every* receiver must
+  cope with that today, because the peer may already do it.
 - **Retransmit (Phase 2):** `0x80` Retransmit Request / `0x81` Retransmit Error
   (§7.2.3–7.2.4).
 
-Phase 1: dedup + in-order acceptance; drop-and-continue on gaps (fine on a quiet LAN).
+### 5.1 Dedup needs a window, not a last-seen value
+
+Remembering only the newest Sequence Number is **not sufficient**, and fails in a way
+that is easy to miss. FEC prepends previous commands **oldest-first** (§7.2.2 "FEC
+Packet Order"), so a datagram carries `[N-2, N-1, N]`. Compared against the newest
+value alone, `N-2` does not match, gets delivered a second time, *and* drags the
+marker backwards so `N-1` misses too. Against a standard two-repeat sender that
+delivers **every message three times** — every note-on fired three times.
+
+This library keeps a **64-entry replay window** (a `uint64_t` bitmap relative to the
+highest Sequence Number processed — the shape IPsec uses). All comparisons are in
+16-bit wrapping arithmetic, so the `0xFFFF → 0x0000` wrap (§5.6) needs no special
+case, and a sender that restarts its numbering just jumps the window forward.
+Anything older than the window is treated as already-seen.
+
+Zero-length UMP Data carries a Sequence Number like any other (§7.2.1), so it enters
+the window too, even though there is nothing to deliver.
+
+**Out-of-order commands are delivered, not held back.** An unseen Sequence Number is
+passed on whatever its position, because that is exactly how FEC repairs a gap: the
+missing command arrives inside a *later* datagram, so refusing it for being out of
+order would discard the recovery FEC exists to provide. The cost is that a repaired
+message reaches the application after ones that followed it — with MIDI that can mean
+a late note-on after its note-off. Reordering with a jitter buffer belongs above this
+layer; this one guarantees *no duplicates*, not *in order*.
 
 ---
 
