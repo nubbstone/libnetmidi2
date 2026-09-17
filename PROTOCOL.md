@@ -232,4 +232,24 @@ Phase 1: dedup + in-order acceptance; drop-and-continue on gaps (fine on a quiet
 The MA spec's **Appendix A.1** gives example byte-for-byte UDP packets. Both ends
 should include a unit test that builds each Phase-1 command and asserts the exact
 bytes against those vectors — that's the cheapest guarantee the two implementations
-agree. (To be transcribed here from the spec PDF.)
+agree.
+
+**Done on this side:** `tests/conformance_vectors.cpp` checks all four A.1 vectors
+in both directions (we must build exactly those bytes, and parse exactly those bytes
+back):
+
+| Vector | Figure | What it pins down |
+|---|---|---|
+| A.1.1 Invitation | 12 | csd1 = name length in words, csd2 = Capabilities; name gets its `0x00` terminator + padding, Product Instance Id already ends on a word boundary so it does not |
+| A.1.2 UMP Data | 13 | one UMP (Timing Clock), Seq `0x0010` |
+| A.1.3 UMP Data | 14 | **one** command carrying **two** UMPs, Seq `0x0011` |
+| A.1.4 UMP Data ×2 | 15 | **two** commands in **one** datagram, Seq `0x3456`/`0x3457` — the FEC shape; catches a parser that stops after the first command |
+
+Why this matters more than it looks: the loopback test runs our client against our
+host, so a wire-format error is invisible to it — both ends make the same mistake
+and it cancels out. Verified by fault injection: flipping `put32`/`get32` to
+little-endian leaves `session_loopback` passing 24/24 while the conformance vectors
+fail on byte 0.
+
+No published vectors exist for Invitation Reply: Accepted, Ping/Ping Reply, Bye or
+NAK, so those remain covered only by the loopback.

@@ -71,8 +71,9 @@ runnable example with POSIX adapters.
 ```
 include/netmidi2/  Protocol.h · Platform.h · Session.h   (the whole library)
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
-tests/             session_loopback.cpp — Host+Client over real localhost UDP
-CMakeLists.txt     INTERFACE target `netmidi2` + the loopback test (add_test)
+tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
+                   session_loopback.cpp    — Host+Client over real localhost UDP
+CMakeLists.txt     INTERFACE target `netmidi2` + both tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder — unset)
@@ -103,12 +104,20 @@ LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder —
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # runs the UDP loopback test
+ctest --test-dir build --output-on-failure     # conformance vectors + loopback
 ```
 
-The loopback test stands up a Host and a Client `Session` over real localhost UDP
-and asserts: full handshake → both Established, bidirectional UMP delivery,
-duplicate‑sequence ignored, graceful Bye → both Closed.
+Two suites:
+
+- **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
+  against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
+  test that can catch a wire‑format error: the loopback runs our code against our own
+  code, so a symmetric mistake cancels out and passes. Keep it that way — if a vector
+  fails, **the library is wrong, not the vector** (spec > PROTOCOL.md > code).
+- **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
+  `Session` over real localhost UDP: full handshake → both Established, bidirectional
+  UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
+  NAK re‑invite, stranger traffic rejected, liveness timeout, graceful Bye → Closed.
 
 ## Conventions
 
@@ -118,8 +127,11 @@ duplicate‑sequence ignored, graceful Bye → both Closed.
 - Every new wire behaviour: cite the M2‑124‑UM section, update `PROTOCOL.md` if the
   contract changes, and add/extend a test where practical.
 - Prefer conformance vectors: M2‑124‑UM **Appendix A.1** has example byte‑for‑byte
-  packets — transcribing those into a test is the cheapest interop guarantee (a good
-  first task; not done yet).
+  packets, transcribed in `tests/conformance_vectors.cpp` — the cheapest interop
+  guarantee there is. Extend it whenever the spec publishes a vector for a command
+  you touch. Note the A.1 byte grids are **figures/images**: `pdftotext` cannot read
+  them, so render the page (`pdftoppm -f 50 -l 51 -r 300 -png`) and read it — and
+  read at 300 dpi, because `0x02` and `0x00` are indistinguishable at thumbnail size.
 
 ## Status & roadmap
 
@@ -132,7 +144,7 @@ explicit `host:port`.
 | mDNS discovery (`_midi2._udp` PTR/SRV/TXT) so peers find each other | planned |
 | FEC (redundant UMP Data in a datagram) + Retransmit (`0x80`/`0x81`) | planned |
 | Authentication (Invitation with Auth `0x02`/`0x03`, nonce/sha256) | planned |
-| Spec Appendix A.1 conformance vectors as a unit test | planned |
+| ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
 ## Reference material
 
