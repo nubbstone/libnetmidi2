@@ -155,16 +155,27 @@ private:
      * party off that host, freeing the one slot. "Restart it and it connects"
      * looked like flakiness; it was this.
      *
-     * Two things may still arrive from anywhere. An Invitation, because that is how
-     * a peer is learned in the first place (one aimed at a session that is already
-     * established is still ignored, in onInvitation). And a Ping while no session is
-     * at stake, which peers use to probe liveness before inviting -- answering that
-     * costs nothing and refusing it would make an idle host look dead. */
+     * Three things may still arrive from anywhere, and each is answered without
+     * being accepted -- the handler decides what, if anything, it does to our
+     * session:
+     *
+     *   Invitation, because that is how a peer is learned in the first place (one
+     *   aimed at a session that is already established is still ignored, in
+     *   onInvitation).
+     *
+     *   Bye, because §6.16 requires a Bye Reply "even if there is no Pending or
+     *   Established Session" -- a Bye is repeated until acknowledged, so a sender we
+     *   know nothing about is exactly the one stuck retransmitting. onBye
+     *   acknowledges every Bye but closes only for our own peer.
+     *
+     *   Ping while no session is at stake, which peers use to probe liveness before
+     *   inviting -- answering costs nothing and refusing would make an idle host
+     *   look dead. */
     static bool admits (Command code, bool fromPeer, bool sessionless) noexcept
     {
         if (fromPeer)
             return true;
-        if (code == Command::invitation)
+        if (code == Command::invitation || code == Command::bye)
             return true;
         return sessionless && code == Command::ping;
     }
@@ -250,7 +261,7 @@ private:
             case Command::ping:                    onPing (c, from);       break;
             case Command::pingReply:               break; // liveness already refreshed
             case Command::umpData:                 onUmpData (c);          break;
-            case Command::bye:                     onBye();                break;
+            case Command::bye:                     onBye (from, fromPeer); break;
             case Command::byeReply:                setState (State::closed); break;
             case Command::nak:                     onNak();                break;
             default:                               break; // ignore for Phase 1
@@ -332,10 +343,20 @@ private:
         deliverUmp (c.payload, c.payloadWords);
     }
 
-    void onBye() noexcept
+    void onBye (const Endpoint& from, bool fromPeer) noexcept
     {
-        sendByeReply();
-        setState (State::closed);
+        /* Acknowledge every Bye, to the sender. §6.16: "Because the Bye Command
+         * might be repeated, the Bye Reply shall also be sent if there is no Pending
+         * or Established Session." A sender we have no session with is precisely the
+         * one that will otherwise keep retransmitting until it times out -- the
+         * silence, not the Bye, is the problem. One reply per Bye received. */
+        sendOneTo (from, [] (Writer& w) { return writeByeReply (w); });
+
+        /* ...but only OUR peer's Bye ends OUR session. Acknowledging a stranger is
+         * courtesy; letting one close a session it is not part of was the bug the
+         * "stranger:" checks were written for. */
+        if (fromPeer)
+            setState (State::closed);
     }
 
     void onNak() noexcept
@@ -409,7 +430,8 @@ private:
     }
     void sendPingReply (std::uint32_t id) noexcept { sendOne ([&] (Writer& w) { return writePingReply (w, id); }); }
     void sendBye (ByeReason r) noexcept            { sendOne ([&] (Writer& w) { return writeBye (w, r); }); }
-    void sendByeReply() noexcept                   { sendOne ([&] (Writer& w) { return writeByeReply (w); }); }
+    // (No sendByeReply() to `peer`: a Bye Reply always goes to whoever sent the Bye,
+    //  which is not necessarily our peer — see onBye.)
 
     // Addressed at an arbitrary sender rather than `peer` — these answer whoever
     // sent the offending command, which is not necessarily anyone we know.

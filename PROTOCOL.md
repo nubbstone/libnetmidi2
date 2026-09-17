@@ -153,15 +153,26 @@ Used for keepalive + stale detection: if pings go unanswered for too long, send
 ### 3.5 Bye / Bye Reply — `0xF0` / `0xF1` (§6.16–6.17)
 
 ```
-Bye:       code=0xF0 | payloadLen=n | D1 = Bye reason | payload: optional echoed cmd
+Bye:       code=0xF0 | payloadLen=pl (0..255) | D1 = Bye Reason | D2 = 0 (Reserved)
+           payload: optional UTF-8 Text Message (pl*4 bytes, null-padded, no BOM)
 Bye Reply: code=0xF1 | payloadLen=0 | cmdSpecific=0
 ```
+
+The Bye payload is a **Text Message**, not an echoed command header (§6.16 Table 26)
+— that is NAK's payload, see §3.6. We send `pl = 0`.
 
 Graceful close from either side; the peer answers Bye Reply, then both go Idle.
 **Bye reason codes seen in the spec** (partial): `0x00` undefined, `0x04` Timeout,
 `0x05` Session not Established, `0x06` No Pending Invitation, `0x40` reject (user),
 `0x41` Rejected (no prior session), `0x43` Authentication failed, `0x45` No matching
 Auth method, `0x80` Invitation Canceled.
+
+**Always acknowledge a Bye.** §6.16: "Because the Bye Command might be repeated, the
+Bye Reply shall also be sent if there is no Pending or Established Session." Send
+exactly one Bye Reply per Bye received, **to the sender**. A sender we have no
+session with is precisely the one that would otherwise retransmit until it times
+out. Acknowledging is not accepting: only our own peer's Bye closes our session —
+letting any sender close it was a real bug (see the `stranger:` tests).
 
 ### 3.6 NAK — `0x8F` (§6.15)
 

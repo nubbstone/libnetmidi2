@@ -361,6 +361,18 @@ int main()
         pump (30);
         check (host.state()==State::established, "stranger: Bye does NOT close the session");
 
+        /* ...but it IS acknowledged. §6.16: the Bye Reply "shall also be sent if
+         * there is no Pending or Established Session", because a Bye is repeated
+         * until answered — so the sender we know nothing about is exactly the one
+         * that would otherwise retransmit until it times out. Acknowledging is not
+         * accepting: the check above already confirmed our session is untouched. */
+        {
+            Command code {}; std::uint8_t d1 = 0;
+            const bool got = recvFirst (code, d1);
+            check (got && code == Command::byeReply,
+                   "stranger: ...but the Bye IS acknowledged with a Bye Reply (spec 6.16)");
+        }
+
         // ...and the legitimate peer is completely unaffected by all of it.
         std::uint32_t real[2] = { 0x40B04A00u, 0x80000000u };
         const int cliBefore = clientRec.umpCount;
@@ -544,6 +556,25 @@ int main()
                    "spec-reply: ...echoing the offending command's header word");
         }
         check (idleHost.state() == State::idle, "spec-reply: ...and still no session was created");
+
+        // --- §6.16: a Bye with no session at all is still acknowledged -------
+        // The case the spec is actually about: a peer is tearing down a session we
+        // have no record of (we restarted), and it repeats the Bye until answered.
+        // Unanswered, it retransmits until it times out.
+        {
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); writeBye (w, ByeReason::undefined);
+            farEnd.send (ihEp, buf, w.size());
+        }
+        for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }
+        {
+            Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
+            const bool got = farRecvFirst (code, d1, word0);
+            check (got && code == Command::byeReply,
+                   "spec-reply: a Bye with no session is still acknowledged");
+        }
+        check (idleHost.state() == State::idle,
+               "spec-reply: ...and acknowledging it did not create or close anything");
 
         // --- a supported command must NOT be NAK'ed --------------------------
         // Ping is answered (an idle host that refuses to answer looks dead), and the

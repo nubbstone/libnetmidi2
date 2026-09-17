@@ -125,12 +125,15 @@ Three suites:
   §5.5 replies owed to a sender we have no session with, liveness timeout, graceful
   Bye → Closed.
 
-**Replying vs accepting.** Three things are answered regardless of who sent them —
-an Invitation, a sessionless Ping, and the two error replies (Bye `0x05` for UMP Data
-with no session, NAK `0x01` for a command we don't support). Answering is *not*
-accepting: none of them may call `touch()` or change state, or a stranger can hold a
-dead session open. That distinction is load‑bearing; see the `stranger:` and
-`liveness:` checks, which exist because it was once got wrong.
+**Replying vs accepting.** Several things are answered regardless of who sent them —
+an Invitation, a sessionless Ping, a Bye (always acknowledged, §6.16), and the two
+error replies (Bye `0x05` for UMP Data with no session, NAK `0x01` for a command we
+don't support). Answering is *not* accepting: none of them may call `touch()` or
+change state, and only our own peer's Bye closes our session. Replies go to the
+**sender**, never to `peer` — an idle `Session` has no `peer`, and replying there
+sent Ping Replies to an empty endpoint for as long as that code existed. That
+distinction is load‑bearing; see the `stranger:`, `liveness:` and `spec-reply:`
+checks, each of which exists because some part of it was once got wrong.
 
 **Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
 hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught
