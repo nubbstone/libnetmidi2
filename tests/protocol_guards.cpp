@@ -274,6 +274,66 @@ int main()
         check (sawEchoed == 0x82000000u, "the echoed header word survives the round trip");
     }
 
+    //-- Invitation vs Invitation Reply: Accepted ----------------------------
+    // Both are built by one shared helper (writeEndpointIdentity), because §6.4
+    // Table 10 and §6.5 Table 12 are structurally identical. The two places they
+    // are NOT identical are the command code and the meaning of csd2 -- Capabilities
+    // for the Invitation, Reserved 0 for the Reply -- so those are what a shared
+    // builder could quietly get wrong, and what is pinned here.
+    //
+    // Appendix A.1 publishes a vector for the Invitation only (checked byte-exact in
+    // conformance_vectors); the Accepted bytes below are derived from Table 12.
+    std::puts ("\nwriteInvitation / writeInvitationAccepted — shared payload, distinct headers");
+    {
+        const char* name    = "MyDev";
+        const char* product = "8shYe3h5";
+
+        std::uint8_t accepted[kMaxDatagram];
+        Writer wa (accepted, sizeof accepted);
+        check (wa.writeSignature()
+                   && writeInvitationAccepted (wa, name, std::strlen (name),
+                                               product, std::strlen (product)),
+               "Accepted builds without overflow");
+
+        const std::uint8_t wantAccepted[] = {
+            0x4D, 0x49, 0x44, 0x49,
+            0x10, 0x04, 0x02, 0x00,   // Accepted | pl=4 | csd1=2 name words | csd2=0 RESERVED
+            0x4D, 0x79, 0x44, 0x65,   // 'M' 'y' 'D' 'e'
+            0x76, 0x00, 0x00, 0x00,   // 'v' + terminator + padding
+            0x38, 0x73, 0x68, 0x59,   // '8' 's' 'h' 'Y'
+            0x65, 0x33, 0x68, 0x35,   // 'e' '3' 'h' '5'
+        };
+        check (wa.size() == sizeof wantAccepted
+                   && std::memcmp (accepted, wantAccepted, sizeof wantAccepted) == 0,
+               "Accepted matches Table 12 (code 0x10, csd2 = 0 Reserved)");
+
+        // With Capabilities 0, the two commands must differ in exactly one byte:
+        // the command code. That is the shared payload, demonstrated rather than
+        // asserted in a comment.
+        std::uint8_t invite[kMaxDatagram];
+        Writer wi (invite, sizeof invite);
+        wi.writeSignature();
+        writeInvitation (wi, 0x00, name, std::strlen (name), product, std::strlen (product));
+
+        std::size_t differing = 0, firstDiff = 0;
+        if (wi.size() == wa.size())
+            for (std::size_t i = 0; i < wi.size(); ++i)
+                if (invite[i] != accepted[i])
+                    { if (differing == 0) firstDiff = i; ++differing; }
+
+        check (wi.size() == wa.size() && differing == 1 && firstDiff == 4,
+               "with caps 0 they differ in exactly one byte: the command code");
+
+        // ...and Capabilities really does land in csd2 of the Invitation, which is
+        // the one field the Reply must never carry.
+        std::uint8_t withCaps[kMaxDatagram];
+        Writer wc (withCaps, sizeof withCaps);
+        wc.writeSignature();
+        writeInvitation (wc, 0x03, name, std::strlen (name), product, std::strlen (product));
+        check (wc.size() > 7 && withCaps[6] == 0x02 && withCaps[7] == 0x03,
+               "Invitation puts name words in csd1 and Capabilities in csd2");
+    }
+
     printf ("\n%s: protocol guards (%d/%d)\n",
             passes == checks ? "PASS" : "FAIL", passes, checks);
     return passes == checks ? 0 : 1;

@@ -83,7 +83,7 @@ public:
             return false;
         std::uint8_t buf[kMaxDatagram];
         Writer w (buf, sizeof buf);
-        if (! (w.writeSignature() && writeUmpData (w, txSeq, words, count)))
+        if (! (w.writeSignature() && writeUmpData (w, txSeq, words, count) && w.ok()))
             return false;
         ++txSeq;
         return plat.socket->send (peer, buf, w.size()) >= 0;
@@ -403,7 +403,9 @@ private:
     {
         std::uint8_t buf[kMaxDatagram];
         Writer w (buf, sizeof buf);
-        if (w.writeSignature() && build (w))
+        // w.ok() last: the backstop against a builder that fails to report a write
+        // that did not fit. A truncated datagram must never reach the wire.
+        if (w.writeSignature() && build (w) && w.ok())
             plat.socket->send (to, buf, w.size());
     }
 
