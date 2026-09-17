@@ -17,10 +17,19 @@ target_compile_features(netmidi2 INTERFACE cxx_std_17)
 
 # Consumers: target_link_libraries(<their_target> PRIVATE netmidi2)
 
-# Loopback test — runs a Host + Client Session over real localhost UDP (POSIX only).
-if(UNIX AND NOT NETMIDI2_SKIP_TESTS)
-    add_executable(nm2_session_loopback tests/session_loopback.cpp)
-    target_link_libraries(nm2_session_loopback PRIVATE netmidi2)
+if(NOT NETMIDI2_SKIP_TESTS)
     enable_testing()
-    add_test(NAME nm2_session_loopback COMMAND nm2_session_loopback)
+
+    # Conformance vectors — byte-for-byte against M2-124-UM Appendix A.1. Pure unit
+    # test over Protocol.h: no sockets, no clock, so it builds anywhere.
+    add_executable(nm2_conformance_vectors tests/conformance_vectors.cpp)
+    target_link_libraries(nm2_conformance_vectors PRIVATE netmidi2)
+    add_test(NAME nm2_conformance_vectors COMMAND nm2_conformance_vectors)
+
+    # Loopback test — runs a Host + Client Session over real localhost UDP (POSIX only).
+    if(UNIX)
+        add_executable(nm2_session_loopback tests/session_loopback.cpp)
+        target_link_libraries(nm2_session_loopback PRIVATE netmidi2)
+        add_test(NAME nm2_session_loopback COMMAND nm2_session_loopback)
+    endif()
 endif()
