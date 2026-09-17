@@ -66,9 +66,14 @@ enum class ByeReason : std::uint8_t
     invitationCanceled   = 0x80,
 };
 
+// §6.15, Table 25.
 enum class NakReason : std::uint8_t
 {
-    commandNotExpected   = 0x02,
+    other                = 0x00,   // reason is in the Text Message field
+    commandNotSupported  = 0x01,   // we do not implement that command (§5.5)
+    commandNotExpected   = 0x02,   // supported, but not valid right now
+    commandMalformed     = 0x03,   // missing payload / unparseable values
+    badPingReply         = 0x20,   // Ping Reply carried the wrong Ping Id
 };
 
 //==============================================================================
@@ -217,6 +222,16 @@ inline bool writeByeReply (Writer& w) noexcept
     return w.writeHeader (Command::byeReply, 0, 0);
 }
 
+// NAK (§6.15, Table 24). csd1 = NAK Reason, csd2 = 0 (Reserved — NOT the offending
+// command code). The payload's first word is the header word of the command being
+// NAK'ed, copied verbatim; an optional UTF-8 Text Message may follow, which we do
+// not send. pl is therefore 1.
+inline bool writeNak (Writer& w, NakReason reason, std::uint32_t nakedHeaderWord) noexcept
+{
+    const std::uint16_t csd = std::uint16_t (std::uint16_t (std::uint8_t (reason)) << 8);
+    return w.writeHeader (Command::nak, 1, csd) && w.u32 (nakedHeaderWord);
+}
+
 //==============================================================================
 // Parsing. A received datagram is walked command-by-command; the caller handles
 // each via the callbacks it cares about.
@@ -229,6 +244,15 @@ struct ParsedCommand
     const std::uint8_t* payload;   // payloadWords*4 bytes, or nullptr if none
     std::uint8_t   data1() const noexcept { return std::uint8_t (cmdSpecific >> 8); }
     std::uint8_t   data2() const noexcept { return std::uint8_t (cmdSpecific); }
+
+    // The command's own 32-bit header, rebuilt from the parsed fields. NAK echoes
+    // this back verbatim to say which command it is complaining about (§6.15).
+    std::uint32_t  headerWord() const noexcept
+    {
+        return (std::uint32_t (std::uint8_t (code)) << 24)
+             | (std::uint32_t (payloadWords)        << 16)
+             |  std::uint32_t (cmdSpecific);
+    }
 };
 
 // Verifies the signature, then invokes `fn(const ParsedCommand&)` for each command

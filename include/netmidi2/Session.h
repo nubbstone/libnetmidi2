@@ -169,11 +169,69 @@ private:
         return sessionless && code == Command::ping;
     }
 
+    // The commands this implementation actually acts on. Anything else -- including
+    // codes the spec defines but we have not implemented (auth, retransmit, session
+    // reset) -- is "not supported" as far as a peer is concerned, and §5.5 says to
+    // say so rather than stay silent.
+    static bool isSupported (Command code) noexcept
+    {
+        switch (code)
+        {
+            case Command::umpData:
+            case Command::invitation:
+            case Command::invitationReplyAccepted:
+            case Command::ping:
+            case Command::pingReply:
+            case Command::bye:
+            case Command::byeReply:
+            case Command::nak:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /* Two replies are owed to the SENDER regardless of whether we have a session
+     * with them, so they are answered ahead of the peer-admission gate. Returns
+     * true if the command was dealt with here and must not be dispatched.
+     *
+     * Neither reply may call touch() or change state: a stranger must not be able
+     * to hold our liveness timer open (that was a real bug -- see the "stranger:"
+     * checks), and answering is not the same as accepting.
+     *
+     * Why answer a stranger at all? Because silence is what made the mirror-image
+     * bug so hard to find. A peer that still believes in a session we have
+     * forgotten -- because we restarted -- will otherwise send UMP Data into the
+     * void forever, with nothing to tell it to re-invite. That is exactly the
+     * failure the NAK handler was added to fix, seen from the other side. */
+    bool answerProtocolError (const ParsedCommand& c, const Endpoint& from,
+                              bool fromPeer) noexcept
+    {
+        // §5.5: unknown/unsupported Command Code -> NAK "Command not supported".
+        if (! isSupported (c.code))
+        {
+            sendNakTo (from, NakReason::commandNotSupported, c);
+            return true;
+        }
+
+        // §7.1: UMP Data outside an Established Session -> Bye reason 0x05.
+        if (c.code == Command::umpData && ! (fromPeer && st == State::established))
+        {
+            sendByeTo (from, ByeReason::sessionNotEstablished);
+            return true;
+        }
+
+        return false;
+    }
+
     //== dispatch =============================================================
     void handleCommand (const ParsedCommand& c, const Endpoint& from) noexcept
     {
         const bool fromPeer    = isFromPeer (from);
         const bool sessionless = isSessionless();
+
+        if (answerProtocolError (c, from, fromPeer))
+            return;
 
         if (! admits (c.code, fromPeer, sessionless))
             return;
@@ -189,7 +247,7 @@ private:
         {
             case Command::invitation:              onInvitation (from);    break;
             case Command::invitationReplyAccepted: onInvitationAccepted(); break;
-            case Command::ping:                    onPing (c);             break;
+            case Command::ping:                    onPing (c, from);       break;
             case Command::pingReply:               break; // liveness already refreshed
             case Command::umpData:                 onUmpData (c);          break;
             case Command::bye:                     onBye();                break;
@@ -240,10 +298,16 @@ private:
             setState (State::established);
     }
 
-    void onPing (const ParsedCommand& c) noexcept
+    void onPing (const ParsedCommand& c, const Endpoint& from) noexcept
     {
+        /* Reply to whoever pinged, not to `peer`. An idle host is allowed to answer
+         * a Ping from anyone (that is how a peer probes us before inviting), but it
+         * has no `peer` yet -- so replying to `peer` sent the Ping Reply to an empty
+         * endpoint and the prober heard nothing, which is exactly the "looks dead"
+         * failure answering was meant to avoid. When a session does exist, `from`
+         * has already been checked to be that peer, so this is the same address. */
         if (c.payload)
-            sendPingReply (get32 (c.payload));
+            sendOneTo (from, [id = get32 (c.payload)] (Writer& w) { return writePingReply (w, id); });
     }
 
     void onUmpData (const ParsedCommand& c) noexcept
@@ -314,12 +378,18 @@ private:
 
     //== outbound single-command datagrams =====================================
     template <typename Build>
-    void sendOne (Build&& build) noexcept
+    void sendOneTo (const Endpoint& to, Build&& build) noexcept
     {
         std::uint8_t buf[kMaxDatagram];
         Writer w (buf, sizeof buf);
         if (w.writeSignature() && build (w))
-            plat.socket->send (peer, buf, w.size());
+            plat.socket->send (to, buf, w.size());
+    }
+
+    template <typename Build>
+    void sendOne (Build&& build) noexcept
+    {
+        sendOneTo (peer, static_cast<Build&&> (build));
     }
 
     void sendInvitation() noexcept
@@ -340,6 +410,19 @@ private:
     void sendPingReply (std::uint32_t id) noexcept { sendOne ([&] (Writer& w) { return writePingReply (w, id); }); }
     void sendBye (ByeReason r) noexcept            { sendOne ([&] (Writer& w) { return writeBye (w, r); }); }
     void sendByeReply() noexcept                   { sendOne ([&] (Writer& w) { return writeByeReply (w); }); }
+
+    // Addressed at an arbitrary sender rather than `peer` — these answer whoever
+    // sent the offending command, which is not necessarily anyone we know.
+    void sendByeTo (const Endpoint& to, ByeReason r) noexcept
+    {
+        sendOneTo (to, [&] (Writer& w) { return writeBye (w, r); });
+    }
+
+    void sendNakTo (const Endpoint& to, NakReason r, const ParsedCommand& c) noexcept
+    {
+        const std::uint32_t echoed = c.headerWord();
+        sendOneTo (to, [&] (Writer& w) { return writeNak (w, r, echoed); });
+    }
 
     static std::size_t cstrlen (const char* s) noexcept
     {

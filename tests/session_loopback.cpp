@@ -308,6 +308,19 @@ int main()
 
         const int hostRxBefore = hostRec.umpCount;
 
+        // Pull one datagram off the stranger's socket and report its first command.
+        auto recvFirst = [&] (Command& codeOut, std::uint8_t& data1Out) -> bool {
+            std::uint8_t in[256]; Endpoint from;
+            const int n = stranger.receive (in, sizeof in, from);
+            if (n <= 0)
+                return false;
+            bool got = false;
+            parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                if (! got) { codeOut = c.code; data1Out = c.data1(); got = true; }
+            });
+            return got;
+        };
+
         /* Order matters: the Bye goes LAST. Sent first it would close the session,
          * and the UMP and Ping checks below would then pass for the wrong reason
          * -- rejected as "no session" rather than as "not your session". */
@@ -321,11 +334,26 @@ int main()
         check (hostRec.umpCount == hostRxBefore, "stranger: UMP_DATA is NOT delivered");
         check (host.state()==State::established, "stranger: still established after stray UMP");
 
+        /* §7.1: UMP Data received outside an Established Session shall be answered
+         * with Bye reason 0x05. We are established -- but not with THIS sender, so
+         * from its point of view there is no session and it is owed the Bye. Being
+         * told is the point: a peer that still believes in a session we no longer
+         * have (because we restarted) would otherwise transmit into the void
+         * forever. Answering must not disturb our real session, which the checks
+         * above and below confirm. */
+        {
+            Command code {}; std::uint8_t d1 = 0;
+            const bool got = recvFirst (code, d1);
+            check (got && code == Command::bye
+                       && d1 == std::uint8_t (ByeReason::sessionNotEstablished),
+                   "stranger: stray UMP_DATA is answered with Bye 0x05 (spec 7.1)");
+        }
+
         sendRaw ([] (Writer& w) { writePing (w, 0x99u); });
         pump (30);
         {
-            std::uint8_t in[128]; Endpoint from;
-            check (stranger.receive (in, sizeof in, from) <= 0,
+            Command code {}; std::uint8_t d1 = 0;
+            check (! recvFirst (code, d1),
                    "stranger: Ping into an established session is NOT answered");
         }
 
@@ -431,6 +459,107 @@ int main()
         client.sendUmp (good, 2);
         pump (40);
         check (hostRec.umpCount == hostRxBefore + 1, "oversized: a valid UMP still flows after");
+    }
+
+    // 7d. The two replies the spec owes a sender we have no session with.
+    //
+    // Both are about not leaving a peer guessing. Silence is what made the NAK bug
+    // (section 6) so expensive to find: a peer transmitting into a session the other
+    // end has forgotten gets no signal at all, and cannot know to re-invite.
+    //
+    //   §7.1  UMP Data while not Established -> Bye reason 0x05. This is the
+    //         restart case: we reboot, the peer still believes in the session and
+    //         keeps sending. The Bye is what tells it otherwise.
+    //   §5.5  A Command Code we do not support -> NAK reason 0x01, echoing the
+    //         offending command's header word so the sender knows which one.
+    //
+    // Neither may refresh liveness or alter state -- answering is not accepting.
+    {
+        PosixUdp idleHostSock, farEnd;
+        std::uint16_t ihPort = 0, fePort = 0;
+        check (idleHostSock.bind (0, ihPort) && farEnd.bind (0, fePort), "spec-reply: sockets bound");
+
+        Platform ihPlat { &idleHostSock, &clock, nullptr };
+        Recorder ihRec ("idlehost");
+        Session idleHost (ihPlat, Role::host, &ihRec, "Idle Host", "IDLE-HOST-1");
+        idleHost.listen();                       // listening, but no session with anyone
+
+        Endpoint ihEp {}; std::strcpy (ihEp.address, "127.0.0.1"); ihEp.port = ihPort;
+
+        auto farRecvFirst = [&] (Command& codeOut, std::uint8_t& d1Out,
+                                 std::uint32_t& firstWordOut) -> bool {
+            std::uint8_t in[256]; Endpoint from;
+            const int n = farEnd.receive (in, sizeof in, from);
+            if (n <= 0)
+                return false;
+            bool got = false;
+            parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                if (got) return;
+                codeOut = c.code; d1Out = c.data1();
+                firstWordOut = c.payload ? get32 (c.payload) : 0u;
+                got = true;
+            });
+            return got;
+        };
+
+        // --- §7.1: UMP Data into a session that does not exist ---------------
+        {
+            std::uint32_t note[2] = { 0x40903C00u, 0xFFFF0000u };
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); writeUmpData (w, 0x0001, note, 2);
+            farEnd.send (ihEp, buf, w.size());
+        }
+        for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }
+
+        {
+            Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
+            const bool got = farRecvFirst (code, d1, word0);
+            check (got && code == Command::bye
+                       && d1 == std::uint8_t (ByeReason::sessionNotEstablished),
+                   "spec-reply: UMP_DATA with no session earns Bye 0x05");
+        }
+        check (ihRec.umpCount == 0, "spec-reply: ...and the UMP itself is not delivered");
+        check (idleHost.state() == State::idle, "spec-reply: ...and the host stays idle");
+
+        // --- §5.5: a command code we do not implement ------------------------
+        // Session Reset (0x82) is a real spec command, Phase 2, unimplemented here.
+        // "Not supported" is exactly what NAK 0x01 is for.
+        std::uint32_t offending = 0;
+        {
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature();
+            w.writeHeader (Command::sessionReset, 0, 0);
+            offending = (std::uint32_t (std::uint8_t (Command::sessionReset)) << 24);
+            farEnd.send (ihEp, buf, w.size());
+        }
+        for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }
+
+        {
+            Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
+            const bool got = farRecvFirst (code, d1, word0);
+            check (got && code == Command::nak, "spec-reply: unsupported command earns a NAK");
+            check (d1 == std::uint8_t (NakReason::commandNotSupported),
+                   "spec-reply: ...with reason 0x01 Command Not Supported");
+            check (word0 == offending,
+                   "spec-reply: ...echoing the offending command's header word");
+        }
+        check (idleHost.state() == State::idle, "spec-reply: ...and still no session was created");
+
+        // --- a supported command must NOT be NAK'ed --------------------------
+        // Ping is answered (an idle host that refuses to answer looks dead), and the
+        // answer must be a Ping Reply, not a NAK.
+        {
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            w.writeSignature(); writePing (w, 0x1234u);
+            farEnd.send (ihEp, buf, w.size());
+        }
+        for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }
+        {
+            Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
+            const bool got = farRecvFirst (code, d1, word0);
+            check (got && code == Command::pingReply && word0 == 0x1234u,
+                   "spec-reply: a supported command is answered normally, not NAK'ed");
+        }
     }
 
     // 8. Graceful close.
