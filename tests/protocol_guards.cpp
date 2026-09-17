@@ -231,6 +231,49 @@ int main()
                "...which exceeds the §7.1 limit — the handler must reject it");
     }
 
+    //-- NAK encoding --------------------------------------------------------
+    // Appendix A.1 publishes no NAK vector, so these bytes are derived from §6.15
+    // Table 24 rather than transcribed. The field worth pinning is csd2: the table
+    // says Reserved = 0, NOT the offending command's code. The command being
+    // complained about is identified by its whole header word in the payload.
+    std::puts ("\nwriteNak — §6.15 Table 24 encoding");
+    {
+        // NAK a Session Reset (0x82, pl=0, csd=0) as "Command Not Supported".
+        const ParsedCommand offending { Command::sessionReset, 0, 0, nullptr };
+        check (offending.headerWord() == 0x82000000u, "headerWord() rebuilds the command header");
+
+        std::uint8_t buf[kMaxDatagram];
+        Writer w (buf, sizeof buf);
+        const bool built = w.writeSignature()
+                        && writeNak (w, NakReason::commandNotSupported, offending.headerWord());
+        check (built, "builds without overflow");
+
+        const std::uint8_t want[] = {
+            0x4D, 0x49, 0x44, 0x49,   // "MIDI"
+            0x8F, 0x01, 0x01, 0x00,   // NAK | pl=1 | csd1=reason 0x01 | csd2=0 RESERVED
+            0x82, 0x00, 0x00, 0x00,   // the NAK'ed command's header word, verbatim
+        };
+        const bool match = w.size() == sizeof want && std::memcmp (buf, want, sizeof want) == 0;
+        check (match, "NAK encodes as reason in csd1, 0 in csd2, echoed header in the payload");
+        if (! match)
+            for (std::size_t i = 0; i < sizeof want && i < w.size(); ++i)
+                if (buf[i] != want[i])
+                    printf ("        byte %2zu: got 0x%02X, want 0x%02X\n", i, buf[i], want[i]);
+
+        // ...and it round-trips.
+        std::uint8_t sawReason = 0xFF, sawReserved = 0xFF;
+        std::uint32_t sawEchoed = 0;
+        const bool ok = parseDatagram (buf, w.size(), [&] (const ParsedCommand& c) {
+            sawReason   = c.data1();
+            sawReserved = c.data2();
+            sawEchoed   = c.payload ? get32 (c.payload) : 0u;
+        });
+        check (ok && sawReason == std::uint8_t (NakReason::commandNotSupported),
+               "parses back with reason 0x01");
+        check (sawReserved == 0, "csd2 reads back as 0 (Reserved)");
+        check (sawEchoed == 0x82000000u, "the echoed header word survives the round trip");
+    }
+
     printf ("\n%s: protocol guards (%d/%d)\n",
             passes == checks ? "PASS" : "FAIL", passes, checks);
     return passes == checks ? 0 : 1;

@@ -121,8 +121,16 @@ Three suites:
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
-  NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, liveness
-  timeout, graceful Bye → Closed.
+  NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, the §7.1 /
+  §5.5 replies owed to a sender we have no session with, liveness timeout, graceful
+  Bye → Closed.
+
+**Replying vs accepting.** Three things are answered regardless of who sent them —
+an Invitation, a sessionless Ping, and the two error replies (Bye `0x05` for UMP Data
+with no session, NAK `0x01` for a command we don't support). Answering is *not*
+accepting: none of them may call `touch()` or change state, or a stranger can hold a
+dead session open. That distinction is load‑bearing; see the `stranger:` and
+`liveness:` checks, which exist because it was once got wrong.
 
 **Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
 hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught

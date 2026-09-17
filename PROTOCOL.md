@@ -77,7 +77,9 @@ Multiple command packets may be packed into one datagram after the single signat
 | `0xF0` | **Bye**                             | D1=Bye reason          | optional echoed command          | both | 1     |
 | `0xF1` | **Bye Reply**                       | 0                      | none                             | both | 1     |
 
-An unknown Command Code → reply **NAK** "command not supported" (§5.5).
+An unknown Command Code → reply **NAK reason `0x01`** "Command Not Supported" (§5.5).
+So does a code the spec defines but this implementation does not support — from a
+sender's point of view those are the same thing. See §3.6.
 
 **Phase 1** (what both ends implement first): UMP Data, Invitation / Accepted,
 Ping / Ping Reply, Bye / Bye Reply, NAK. No authentication, no retransmit
@@ -103,7 +105,12 @@ payload: pl x 32-bit words = zero or more WHOLE UMP messages (never split a UMP)
 > triggerable stack buffer overflow until `Session` checked it on receipt too
 > (`kMaxUmpWordsPerCommand`, regression-tested as "oversized:").
 
-- Only valid in the **Established** state; otherwise reply Bye reason `0x05`.
+- Only valid in the **Established** state; otherwise reply **Bye reason `0x05`**
+  (Session not Established) to the sender — §7.1 makes this a *shall*, and it is the
+  only thing that tells a peer still transmitting into a session we have forgotten
+  (because we restarted) that it needs to re-invite. We answer any sender, since a
+  sender we have no session with is precisely the one that needs telling; answering
+  never refreshes our liveness timer or alters our state.
 - Sequence Number: 16-bit, per-sender per-session, starts `0x0000`, +1 per UMP Data
   command, wraps after `0xFFFF` (§5.6, §7.1). One seq number covers all UMPs in the
   command.
@@ -159,12 +166,33 @@ Auth method, `0x80` Invitation Canceled.
 ### 3.6 NAK — `0x8F` (§6.15)
 
 ```
-NAK: code=0x8F | payloadLen=n | D1 = NAK reason | D2 = offending Command Code
-     payload: the echoed header of the offending command (+ optional text)
+NAK: code=0x8F | payloadLen=pl (1..255) | D1 = NAK Reason | D2 = 0 (Reserved)
+     payload: word 0 = header word of the offending command, copied verbatim
+              words 1.. = optional UTF-8 Text Message ((pl-1)*4 bytes)
 ```
 
-NAK reasons include `0x02` "Command Not Expected" and "command not supported".
-NAK has no reply; send once.
+**D2 is Reserved and must be 0** (§6.15 Table 24) — *not* the offending command's
+code, as an earlier version of this document claimed. The offending command is
+identified by its whole 32-bit header echoed in the payload, so the minimum `pl` is
+**1**. We send no Text Message, so we always send `pl = 1` (a 12-byte datagram).
+
+NAK reasons (§6.15 Table 25):
+
+| Value | Reason | Used for |
+|---|---|---|
+| `0x00` | Other | reason is in the Text Message |
+| `0x01` | **Command Not Supported** | a Command Code we don't implement (§5.5) |
+| `0x02` | Command Not Expected | supported, but not valid right now (e.g. an unsolicited Ping Reply) |
+| `0x03` | Command Malformed | missing payload / unparseable values. *Not* to be sent merely because a payload is longer than expected |
+| `0x20` | Bad Ping Reply | Ping Reply carried the wrong Ping Id |
+
+NAK has no reply; send once. On **receiving** NAK `0x01`, do not send that command
+again (§5.5).
+
+**We send NAK `0x01`** for any Command Code we do not implement — which includes
+spec-defined Phase 2/3 commands (auth `0x02`/`0x03`, retransmit `0x80`/`0x81`,
+session reset `0x82`/`0x83`, the other Invitation Replies) as well as codes that
+aren't in the spec at all. §5.5 requires an answer rather than silence.
 
 ---
 
