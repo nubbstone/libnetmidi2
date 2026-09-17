@@ -133,11 +133,31 @@ payload: [csd1 words]         UMP Endpoint Name  (UTF-8, ≤ 98 bytes, null-padd
 ### 3.3 Invitation Reply: Accepted — `0x10` (§6.5)  *(Host → Client)*
 
 ```
-header:  code=0x10 | payloadLen=pl | D1 = name length in words | D2 = 0
+header:  code=0x10 | payloadLen=pl (2..36) | D1 = name length in words
+                                             D2 = 0 (Reserved)
 payload: Host's UMP Endpoint Name + Product Instance Id   (same encoding as 3.2)
 ```
 
 Establishes the session. (Pending `0x11` / Auth `0x12`,`0x13` are Phase 2/3.)
+
+Structurally identical to the Invitation (§3.2) — same csd1, same two padded strings
+— differing only in the code and in csd2 being Reserved rather than Capabilities.
+One builder emits both.
+
+**On receipt, §6.5 gives two rules, and the order between them matters:**
+
+1. **Already Established with that host → ignore it.** A host repeats its Accepted
+   until it sees traffic (see §3.2 / the lost-acceptance recovery), so a duplicate
+   arriving right after the session opened is routine, not an error.
+2. **Otherwise, no pending invitation → Bye reason `0x06`** (No Pending Invitation).
+
+Check (1) first. Reversed, a client answers its own host's retransmission with a Bye
+and destroys the session it just opened — using the handshake's own recovery
+mechanism to do it. That is strictly worse than the silence rule 2 replaces, and is
+regression-tested (`dup-accept:`).
+
+An Accepted from an endpoint we never invited **must not establish anything**,
+however well-formed — otherwise any box on the LAN could hand us a session unasked.
 
 ### 3.4 Ping / Ping Reply — `0x20` / `0x21` (§6.13–6.14)
 

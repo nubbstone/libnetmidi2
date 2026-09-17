@@ -126,14 +126,24 @@ Three suites:
   Bye → Closed.
 
 **Replying vs accepting.** Several things are answered regardless of who sent them —
-an Invitation, a sessionless Ping, a Bye (always acknowledged, §6.16), and the two
-error replies (Bye `0x05` for UMP Data with no session, NAK `0x01` for a command we
+an Invitation, a sessionless Ping, a Bye (always acknowledged, §6.16), an Invitation
+Reply: Accepted (§6.5), and the error replies (Bye `0x05` for UMP Data with no
+session, Bye `0x06` for an Accepted we never invited, NAK `0x01` for a command we
 don't support). Answering is *not* accepting: none of them may call `touch()` or
-change state, and only our own peer's Bye closes our session. Replies go to the
-**sender**, never to `peer` — an idle `Session` has no `peer`, and replying there
-sent Ping Replies to an empty endpoint for as long as that code existed. That
-distinction is load‑bearing; see the `stranger:`, `liveness:` and `spec-reply:`
-checks, each of which exists because some part of it was once got wrong.
+change state, only our own peer's Bye closes our session, and only an endpoint we
+actually invited can establish one. Replies go to the **sender**, never to `peer` —
+an idle `Session` has no `peer`, and replying there sent Ping Replies to an empty
+endpoint for as long as that code existed. That distinction is load‑bearing; see the
+`stranger:`, `liveness:`, `spec-reply:` and `dup-accept:` checks, each of which
+exists because some part of it was once got wrong.
+
+**Careful with the "tell them" replies.** Each was added to stop a peer transmitting
+into silence — but a reply sent in the wrong state is worse than no reply. The
+sharpest case: §6.5 says to Bye `0x06` an Accepted with no pending invitation, *and*
+to ignore one that arrives when already Established. Since hosts retransmit the
+Accepted until they see traffic, checking those in the wrong order makes a client
+destroy its own session with the host's own recovery packet. When adding another of
+these, ask what happens when it fires against a legitimate retransmission.
 
 **Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
 hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught

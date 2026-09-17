@@ -576,6 +576,32 @@ int main()
         check (idleHost.state() == State::idle,
                "spec-reply: ...and acknowledging it did not create or close anything");
 
+        // --- §6.5: an Accepted with no invitation outstanding ----------------
+        // "If a Client receives this Command when it is not in a Pending Session
+        // with the Host, then the Client shall send a Bye Command to the Host with
+        // reason 0x06 (No Pending Invitation)."
+        //
+        // It must also NOT open a session. An Accepted from an endpoint we never
+        // invited is either a stale retransmission or someone handing us a session
+        // unasked; neither may establish one.
+        {
+            std::uint8_t buf[64]; Writer w (buf, sizeof buf);
+            const char* n = "Pushy Host"; const char* p = "PUSHY-1";
+            w.writeSignature();
+            writeInvitationAccepted (w, n, std::strlen (n), p, std::strlen (p));
+            farEnd.send (ihEp, buf, w.size());
+        }
+        for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }
+        {
+            Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
+            const bool got = farRecvFirst (code, d1, word0);
+            check (got && code == Command::bye
+                       && d1 == std::uint8_t (ByeReason::noPendingInvitation),
+                   "spec-reply: an unsolicited Accepted earns Bye 0x06");
+        }
+        check (idleHost.state() == State::idle,
+               "spec-reply: ...and an uninvited Accepted does NOT open a session");
+
         // --- a supported command must NOT be NAK'ed --------------------------
         // Ping is answered (an idle host that refuses to answer looks dead), and the
         // answer must be a Ping Reply, not a NAK.
@@ -591,6 +617,41 @@ int main()
             check (got && code == Command::pingReply && word0 == 0x1234u,
                    "spec-reply: a supported command is answered normally, not NAK'ed");
         }
+    }
+
+    // 7e. A repeated Accepted must not tear down the session it just opened.
+    //
+    // The dangerous half of §6.5. A host repeats its Invitation Reply: Accepted
+    // until it sees traffic, so a duplicate landing just after the client
+    // established is entirely routine -- not an error. §6.5 says to ignore it when
+    // already Established, and that clause has to be checked BEFORE the "no pending
+    // invitation -> Bye 0x06" clause. Get the order wrong and the client answers its
+    // own host's retransmission with a Bye, using the handshake's own recovery
+    // mechanism to destroy the session. That is a worse bug than the one Bye 0x06
+    // fixes, so it is pinned here.
+    {
+        check (client.state()==State::established, "dup-accept: client established to begin with");
+        const int cliBefore = clientRec.umpCount;
+
+        // Sent from the host's own socket, so it genuinely arrives from the client's
+        // peer -- a stranger's copy would be a different case entirely (7d).
+        Endpoint clientEp {}; std::strcpy (clientEp.address, "127.0.0.1"); clientEp.port = clientPort;
+        {
+            std::uint8_t buf[128]; Writer w (buf, sizeof buf);
+            const char* n = "M2 SoundGen Host"; const char* p = "NUBBSOFT-HOST-1";
+            w.writeSignature();
+            writeInvitationAccepted (w, n, std::strlen (n), p, std::strlen (p));
+            hostSock.send (clientEp, buf, w.size());
+        }
+        pump (40);
+
+        check (client.state()==State::established, "dup-accept: client is STILL established");
+        // If the client had replied Bye 0x06, the host would have closed on receipt.
+        check (host.state()==State::established,   "dup-accept: the host was NOT sent a Bye");
+
+        std::uint32_t good[2] = { 0x40B04B00u, 0x80000000u };
+        host.sendUmp (good, 2); pump (40);
+        check (clientRec.umpCount == cliBefore + 1, "dup-accept: UMP still flows afterwards");
     }
 
     // 8. Graceful close.
