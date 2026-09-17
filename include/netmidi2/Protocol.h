@@ -25,6 +25,12 @@ constexpr std::uint32_t kSignature   = 0x4D494449u; // "MIDI"
 constexpr std::size_t   kMaxDatagram = 1400;        // §5.1.1 — never fragment
 constexpr std::size_t   kHeaderBytes = 4;           // command packet header
 
+// Max payload of ONE UMP Data command, in 32-bit words (§7.1, Table 29: pl is
+// 0...64, "The length shall not exceed 64 words"). A receiver must enforce this on
+// the way in as well as out: Payload Length is a byte off the wire, so an unchecked
+// command can claim up to 255 words.
+constexpr std::uint8_t  kMaxUmpWordsPerCommand = 64;
+
 enum class Command : std::uint8_t
 {
     umpData                 = 0xFF,
@@ -150,7 +156,7 @@ private:
 inline bool writeUmpData (Writer& w, std::uint16_t sequenceNumber,
                           const std::uint32_t* words, std::uint8_t wordCount) noexcept
 {
-    if (wordCount > 64)
+    if (wordCount > kMaxUmpWordsPerCommand)
         return false;
     if (! w.writeHeader (Command::umpData, wordCount, sequenceNumber))
         return false;

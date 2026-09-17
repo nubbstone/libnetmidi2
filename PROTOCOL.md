@@ -94,6 +94,15 @@ header:  code=0xFF | payloadLen=pl (0..64) | cmdSpecific = Sequence Number (16-b
 payload: pl x 32-bit words = zero or more WHOLE UMP messages (never split a UMP)
 ```
 
+> **Receivers must range-check `pl`.** Payload Length is a single byte, so a command
+> can *claim* up to 255 words, while §7.1 Table 29 caps a UMP Data command at **64**
+> ("the length shall not exceed 64 words"). Such a datagram is not malformed framing
+> — 8 + 255×4 = 1028 bytes sits well inside the 1400-byte limit, so a length check on
+> the datagram will not catch it. Anything over 64 words must be dropped. Enforcing
+> this only when *sending* is not enough; in this library it was a remotely
+> triggerable stack buffer overflow until `Session` checked it on receipt too
+> (`kMaxUmpWordsPerCommand`, regression-tested as "oversized:").
+
 - Only valid in the **Established** state; otherwise reply Bye reason `0x05`.
 - Sequence Number: 16-bit, per-sender per-session, starts `0x0000`, +1 per UMP Data
   command, wraps after `0xFFFF` (§5.6, §7.1). One seq number covers all UMPs in the
