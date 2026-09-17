@@ -72,8 +72,9 @@ runnable example with POSIX adapters.
 include/netmidi2/  Protocol.h · Platform.h · Session.h   (the whole library)
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
 tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
+                   protocol_guards.cpp     — malformed/oversized input rejection (unit)
                    session_loopback.cpp    — Host+Client over real localhost UDP
-CMakeLists.txt     INTERFACE target `netmidi2` + both tests (add_test)
+CMakeLists.txt     INTERFACE target `netmidi2` + all three tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder — unset)
@@ -107,17 +108,25 @@ cmake --build build
 ctest --test-dir build --output-on-failure     # conformance vectors + loopback
 ```
 
-Two suites:
+Three suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
   test that can catch a wire‑format error: the loopback runs our code against our own
   code, so a symmetric mistake cancels out and passes. Keep it that way — if a vector
   fails, **the library is wrong, not the vector** (spec > PROTOCOL.md > code).
+- **`nm2_protocol_guards`** (unit, no sockets). The *reject* paths: `Writer` overflow,
+  the §7.1 64‑word limit, bad signature, truncated command. Everything here arrives
+  from the network, so none of it may be assumed well‑formed.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
-  NAK re‑invite, stranger traffic rejected, liveness timeout, graceful Bye → Closed.
+  NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, liveness
+  timeout, graceful Bye → Closed.
+
+**Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
+hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught
+the overflow above cleanly, SIGABRT) rather than assuming your code is at fault.
 
 ## Conventions
 

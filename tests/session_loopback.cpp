@@ -386,6 +386,53 @@ int main()
                "liveness: host still times out despite a stranger's pings");
     }
 
+    // 7c. An over-long UMP Data command must not be believed.
+    //
+    // Regression test for a remotely triggerable stack buffer overflow. Payload
+    // Length is one byte on the wire, so a command can claim up to 255 words, but
+    // §7.1 Table 29 bounds a UMP Data command at 64 and deliverUmp's buffer is sized
+    // for 64. Nothing on the receive path checked it, so a peer claiming 255 wrote
+    // 191 words past the end of that buffer -- straight through the saved registers
+    // and return address of the frames above it.
+    //
+    // It needed no malformed framing at all: 8 header bytes + 255*4 = 1028 bytes is
+    // a perfectly well-formed datagram, comfortably inside the 1400-byte limit, so
+    // parseDatagram's truncation check passed it along without complaint. Sent from
+    // the established peer, so the sender check added in 7 does not mask it.
+    // Confirmed with -fstack-protector-all: SIGABRT, "stack smashing detected".
+    //
+    // Note the shape of this check: the session must SURVIVE and ignore the command.
+    // Before the fix this test did not fail politely, it aborted the whole binary.
+    {
+        const int hostRxBefore = hostRec.umpCount;
+
+        std::uint8_t buf[kMaxDatagram];
+        Writer w (buf, sizeof buf);
+        w.writeSignature();
+        w.writeHeader (Command::umpData, 255, 0x7777);   // 255 words claimed...
+        for (int i = 0; i < 255; ++i)                    // ...and 255 actually sent,
+            w.u32 (0xDEADBEEFu);                         //    so this is NOT truncated
+
+        check (w.size() == 1028 && w.ok(), "oversized: datagram is well-formed (1028 bytes)");
+
+        // Re-establish: step 7b's host timed out, but `host`/`client` from step 1 are
+        // still live and still each other's peer.
+        check (host.state()==State::established, "oversized: pair still established");
+
+        clientSock.send (hostEp, buf, w.size());
+        pump (40);
+
+        check (hostRec.umpCount == hostRxBefore, "oversized: 255-word UMP Data is NOT delivered");
+        check (host.state()==State::established,  "oversized: host survives it and stays established");
+
+        // ...and a legitimate command still works immediately afterwards, so the
+        // guard rejects the bad one without poisoning the session.
+        std::uint32_t good[2] = { 0x40904000u, 0x12340000u };
+        client.sendUmp (good, 2);
+        pump (40);
+        check (hostRec.umpCount == hostRxBefore + 1, "oversized: a valid UMP still flows after");
+    }
+
     // 8. Graceful close.
     client.close(); pump (50);
     check (host.state()==State::closed && client.state()==State::closed, "graceful Bye -> both Closed");

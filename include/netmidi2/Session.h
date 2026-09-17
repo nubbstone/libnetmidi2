@@ -129,147 +129,184 @@ private:
         parseDatagram (data, len, [&] (const ParsedCommand& c) { handleCommand (c, from); });
     }
 
+    //== admission ============================================================
+    // Is this datagram from the endpoint we are actually in a session with?
+    bool isFromPeer (const Endpoint& from) const noexcept
+    {
+        return (st == State::inviting || st == State::established) && from == peer;
+    }
+
+    // No session is at stake in these states, so there is nothing to protect.
+    bool isSessionless() const noexcept
+    {
+        return st == State::idle || st == State::closed;
+    }
+
+    /* Everything that belongs to a session must come FROM that session's peer.
+     * Without this check any box on the LAN can operate on a session it is not part
+     * of: one spoofed 8-byte Bye closes somebody else's session, stray UMP_DATA is
+     * delivered as if the peer had sent it, and a stranger's traffic refreshes the
+     * liveness timer so a peer that is really gone goes on looking alive.
+     *
+     * Measured on the bench, and the reason this was found: a client stuck at
+     * `inviting` against a host that was busy with a third box would connect the
+     * moment its own router was RESTARTED. The restart was not fixing the handshake
+     * -- the parting Bye of the closing session was knocking the innocent third
+     * party off that host, freeing the one slot. "Restart it and it connects"
+     * looked like flakiness; it was this.
+     *
+     * Two things may still arrive from anywhere. An Invitation, because that is how
+     * a peer is learned in the first place (one aimed at a session that is already
+     * established is still ignored, in onInvitation). And a Ping while no session is
+     * at stake, which peers use to probe liveness before inviting -- answering that
+     * costs nothing and refusing it would make an idle host look dead. */
+    static bool admits (Command code, bool fromPeer, bool sessionless) noexcept
+    {
+        if (fromPeer)
+            return true;
+        if (code == Command::invitation)
+            return true;
+        return sessionless && code == Command::ping;
+    }
+
+    //== dispatch =============================================================
     void handleCommand (const ParsedCommand& c, const Endpoint& from) noexcept
     {
-        /* Everything that belongs to a session must come FROM that session's peer.
-         * Without this check any box on the LAN can operate on a session it is not
-         * part of: one spoofed 8-byte Bye closes somebody else's session, stray
-         * UMP_DATA is delivered as if the peer had sent it, and a stranger's
-         * traffic refreshes the liveness timer so a peer that is really gone goes
-         * on looking alive.
-         *
-         * Measured on the bench, and the reason this was found: a client stuck at
-         * `inviting` against a host that was busy with a third box would connect
-         * the moment its own router was RESTARTED. The restart was not fixing the
-         * handshake -- the parting Bye of the closing session was knocking the
-         * innocent third party off that host, freeing the one slot. "Restart it
-         * and it connects" looked like flakiness; it was this.
-         *
-         * Two things may still arrive from anywhere. An Invitation, because that
-         * is how a peer is learned in the first place (one aimed at a session that
-         * is already established is still ignored below). And a Ping while no
-         * session is at stake, which peers use to probe liveness before inviting
-         * -- answering that costs nothing and refusing it would make an idle host
-         * look dead. */
-        const bool fromPeer = (st == State::inviting || st == State::established)
-                              && from == peer;
-        const bool sessionless = (st == State::idle || st == State::closed);
+        const bool fromPeer    = isFromPeer (from);
+        const bool sessionless = isSessionless();
 
-        if (! fromPeer
-            && c.code != Command::invitation
-            && ! (sessionless && c.code == Command::ping))
+        if (! admits (c.code, fromPeer, sessionless))
             return;
 
         /* Only our actual peer keeps the session alive. Notably this excludes an
-         * Invitation from a stranger to an established session: it is allowed
-         * through (to be ignored), but it must not renew the timer that is the
-         * only thing telling us the real peer went away. */
+         * Invitation from a stranger to an established session: it is admitted
+         * above (to be ignored), but it must not renew the timer that is the only
+         * thing telling us the real peer went away. */
         if (fromPeer || sessionless)
             touch();
 
         switch (c.code)
         {
-            case Command::invitation:
-                if (role != Role::host)
-                    break;
+            case Command::invitation:              onInvitation (from);    break;
+            case Command::invitationReplyAccepted: onInvitationAccepted(); break;
+            case Command::ping:                    onPing (c);             break;
+            case Command::pingReply:               break; // liveness already refreshed
+            case Command::umpData:                 onUmpData (c);          break;
+            case Command::bye:                     onBye();                break;
+            case Command::byeReply:                setState (State::closed); break;
+            case Command::nak:                     onNak();                break;
+            default:                               break; // ignore for Phase 1
+        }
+    }
 
-                if (st != State::established)
-                {
-                    peer = from;
-                    sendInvitationAccepted();
-                    setState (State::established);
-                }
-                else if (from == peer)
-                {
-                    /* Already established with this same peer, and it is still
-                     * inviting -- so our InvitationAccepted never arrived. Send it
-                     * again.
-                     *
-                     * Without this the handshake is unrecoverable in one specific
-                     * way: a host that ignores repeat Invitations leaves the client
-                     * retrying forever against a peer that considers the session
-                     * open. The two ends disagree permanently, the host shows
-                     * `established` and the client shows `inviting`, and nothing
-                     * times out because the host keeps hearing the invitations and
-                     * treats them as liveness. Observed between two Raspberry Pis:
-                     * host established with 203.0.113.34:47605 while the client
-                     * owning that very port still reported `inviting`, minutes
-                     * later.
-                     *
-                     * Accepting is idempotent, so re-answering costs one datagram
-                     * per client retry and converges as soon as one gets through.
-                     * An Invitation from a DIFFERENT endpoint is still ignored: one
-                     * session carries one peer, and answering a second would silently
-                     * steal the session from the box already using it. */
-                    sendInvitationAccepted();
-                }
-                break;
+    //== per-command handlers =================================================
+    void onInvitation (const Endpoint& from) noexcept
+    {
+        if (role != Role::host)
+            return;
 
-            case Command::invitationReplyAccepted:
-                if (role == Role::client && st == State::inviting)
-                    setState (State::established);
-                break;
+        if (st != State::established)
+        {
+            peer = from;
+            sendInvitationAccepted();
+            setState (State::established);
+            return;
+        }
 
-            case Command::ping:
-                if (c.payload) sendPingReply (get32 (c.payload));
-                break;
+        /* Already established. If it is the SAME peer, it is still inviting -- so
+         * our InvitationAccepted never arrived. Send it again.
+         *
+         * Without this the handshake is unrecoverable in one specific way: a host
+         * that ignores repeat Invitations leaves the client retrying forever against
+         * a peer that considers the session open. The two ends disagree
+         * permanently, the host shows `established` and the client shows
+         * `inviting`, and nothing times out because the host keeps hearing the
+         * invitations and treats them as liveness. Observed between two Raspberry
+         * Pis: host established with 203.0.113.34:47605 while the client owning
+         * that very port still reported `inviting`, minutes later.
+         *
+         * Accepting is idempotent, so re-answering costs one datagram per client
+         * retry and converges as soon as one gets through. An Invitation from a
+         * DIFFERENT endpoint is ignored: one session carries one peer, and
+         * answering a second would silently steal the session from the box already
+         * using it. */
+        if (from == peer)
+            sendInvitationAccepted();
+    }
 
-            case Command::pingReply:
-                break; // liveness already refreshed by touch()
+    void onInvitationAccepted() noexcept
+    {
+        if (role == Role::client && st == State::inviting)
+            setState (State::established);
+    }
 
-            case Command::umpData:
-                if (st == State::established && c.payloadWords > 0 && c.payload)
-                {
-                    const std::uint16_t seq = c.cmdSpecific;
-                    if (! (haveRx && seq == lastRx))        // ignore exact duplicate
-                    {
-                        haveRx = true; lastRx = seq;
-                        deliverUmp (c.payload, c.payloadWords);
-                    }
-                }
-                break;
+    void onPing (const ParsedCommand& c) noexcept
+    {
+        if (c.payload)
+            sendPingReply (get32 (c.payload));
+    }
 
-            case Command::bye:
-                sendByeReply();
-                setState (State::closed);
-                break;
+    void onUmpData (const ParsedCommand& c) noexcept
+    {
+        /* Payload Length is one byte off the wire, so it can claim up to 255 words
+         * -- but §7.1 Table 29 bounds a UMP Data command at 64. A command over that
+         * is malformed by definition; drop it rather than hand a 255-word count to a
+         * 64-word buffer. (Found by asking why this length was never range-checked
+         * on the way in when writeUmpData has always checked it on the way out.) */
+        if (st != State::established
+            || c.payloadWords == 0
+            || c.payloadWords > kMaxUmpWordsPerCommand
+            || ! c.payload)
+            return;
 
-            case Command::byeReply:
-                setState (State::closed);
-                break;
+        const std::uint16_t seq = c.cmdSpecific;
+        if (haveRx && seq == lastRx)        // ignore exact duplicate
+            return;
 
-            case Command::nak:
-                // The peer rejected something we sent under the assumption that we
-                // were Established -- almost always UMP_DATA after the peer
-                // restarted and has no record of us. This is the client's ONLY
-                // reliable signal that has happened: our own idle-timeout cannot
-                // catch it, because a peer that answers Ping unconditionally
-                // (session-independent, e.g. Zephyr's netmidi2.c) keeps refreshing
-                // touch() forever even with no session at all. Measured against
-                // the Teensy: a NAK arrived for every rejected UMP_DATA, but sat in
-                // the "Phase 1: ignore" default case, so the client stayed
-                // `established` and kept sending into the void indefinitely.
-                //
-                // Re-inviting is safe even if the NAK was actually about
-                // something else (host role sends none today, so in practice this
-                // only fires for a client): worst case is one extra, harmless
-                // handshake round-trip.
-                if (role == Role::client && st == State::established)
-                {
-                    setState (State::idle);
-                    connect (peer);
-                }
-                break;
+        haveRx = true;
+        lastRx = seq;
+        deliverUmp (c.payload, c.payloadWords);
+    }
 
-            default:
-                break; // unhandled — ignore for Phase 1
+    void onBye() noexcept
+    {
+        sendByeReply();
+        setState (State::closed);
+    }
+
+    void onNak() noexcept
+    {
+        // The peer rejected something we sent under the assumption that we were
+        // Established -- almost always UMP_DATA after the peer restarted and has no
+        // record of us. This is the client's ONLY reliable signal that has happened:
+        // our own idle-timeout cannot catch it, because a peer that answers Ping
+        // unconditionally (session-independent, e.g. Zephyr's netmidi2.c) keeps
+        // refreshing touch() forever even with no session at all. Measured against
+        // the Teensy: a NAK arrived for every rejected UMP_DATA, but sat in the
+        // "Phase 1: ignore" default case, so the client stayed `established` and
+        // kept sending into the void indefinitely.
+        //
+        // Re-inviting is safe even if the NAK was actually about something else
+        // (host role sends none today, so in practice this only fires for a
+        // client): worst case is one extra, harmless handshake round-trip.
+        if (role == Role::client && st == State::established)
+        {
+            setState (State::idle);
+            connect (peer);
         }
     }
 
     void deliverUmp (const std::uint8_t* payload, std::uint8_t words) noexcept
     {
         if (! listener) return;
-        std::uint32_t out[64];
+
+        /* Belt and braces: the caller already rejects an over-long command, but this
+         * buffer is sized by the same spec constant that bounds it, and Payload
+         * Length arrives as a raw byte from the network. Never let the two drift. */
+        if (words > kMaxUmpWordsPerCommand)
+            return;
+
+        std::uint32_t out[kMaxUmpWordsPerCommand];
         for (std::uint8_t i = 0; i < words; ++i)
             out[i] = get32 (payload + std::size_t (i) * 4);
         listener->onUmpReceived (out, words);
