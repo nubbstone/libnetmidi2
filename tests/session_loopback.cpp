@@ -977,6 +977,12 @@ int main()
         Session sender (isPlat, Role::host, &isRec, "Idle Sender", "IDLE-SENDER-1");
         Session::Timing t;
         t.pingIntervalMs   = 100000;   // keep pings out of the way
+        // The watcher is a bare socket that never answers, so nothing refreshes
+        // liveness here. This block pumps for several seconds, which on a slow
+        // runner outlived the default 10s timeout and closed the session under the
+        // test -- the failure looked like "sendUmp refused" much later on. Liveness
+        // is not what is under test; take it out of the picture.
+        t.timeoutMs        = 600000;
         t.idleDeclareMs    = 60;
         t.idleDeclareCount = 4;        // 60, 120, 240, 480 then silence
         sender.setTiming (t);
