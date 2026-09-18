@@ -35,16 +35,19 @@ namespace netmidi2
 enum class State { idle, inviting, established, closing, closed };
 enum class Role  { host, client };
 
-/*  Storage for one previously-sent UMP Data command, retained so it can be repeated
-    inside a later datagram (§7.2.2 Forward Error Correction).
+/*  One previously-sent UMP Data command, kept so it can be sent again.
 
-    Caller-owned, like every other buffer here (prime directive 1). FEC costs real
-    memory -- a slot is sized for the largest legal command, 64 words -- and a Session
-    that does not opt in pays none of it. Two slots is what §7.2.2 recommends:
-    "research has shown that using FEC with more than two repeats does not
-    significantly improve data integrity".
+    Two features share this history, which is why it is not called a FEC slot: FEC
+    (§7.2.2) repeats the most recent few inside every new datagram, and Retransmit
+    (§7.2.3) serves them on request. They want different depths -- FEC wants two,
+    a retransmit buffer wants as many as you can afford -- so the array length sets
+    the retransmit depth and setFecRepeats() sets how many of those get prepended.
+
+    Caller-owned, like every other buffer here (prime directive 1). A slot is sized
+    for the largest legal command (64 words), so this is real memory and a Session
+    that opts out pays none of it.
 */
-struct FecSlot
+struct SentUmpSlot
 {
     std::uint16_t seq = 0;
     std::uint8_t  wordCount = 0;
@@ -57,6 +60,16 @@ public:
     virtual ~ISessionListener() = default;
     virtual void onUmpReceived (const std::uint32_t* words, std::uint8_t count) = 0;
     virtual void onStateChanged (State) {}
+
+    /*  UMP with this Sequence Number is gone for good: the peer answered a Retransmit
+        Request with a Retransmit Error, or never answered at all.
+
+        Worth acting on rather than logging. §7.2.4: "the requested UMP data is
+        probably lost and cannot be retrieved. The Device may determine a recovery
+        process appropriate to its own implementation and the unique circumstances,
+        such as triggering an all-notes off" -- because the datagram that went missing
+        may well have carried the Note Off. Default is to do nothing. */
+    virtual void onUmpLost (std::uint16_t /*sequenceNumber*/) {}
 };
 
 class Session
@@ -93,6 +106,15 @@ public:
             consistently receive data". */
         std::uint32_t idleDeclareMs = 250;
         std::uint8_t  idleDeclareCount = 5;
+
+        /*  Retransmit (§7.2.3). "The Device should delay sending the Retransmit
+            Request Command for a short duration, for example 10 milliseconds. That
+            will help recovering from out of order packets and it prevents sending
+            Retransmit Requests too often." Then "repeated (with increasing delay)"
+            -- 10, 20, 40 here -- until the data arrives, an Error or NAK comes back,
+            or we give up and report the loss. */
+        std::uint32_t retransmitDelayMs = 10;
+        std::uint8_t  retransmitMaxRequests = 3;
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -102,20 +124,35 @@ public:
 
     void setTiming (Timing t) noexcept { timing = t; }
 
-    /*  Turn on FEC sending (§7.2.2) by lending the Session somewhere to keep recently
-        sent UMP Data commands. `count` is the number of repeats: 2 is the spec's
-        recommendation, 1 is allowed, 0 (the default, no slots) disables FEC.
+    /*  Lend the Session somewhere to keep recently sent UMP Data commands. This one
+        array powers both resend features, and `count` is how deep it goes:
 
-        Off by default because it is the caller's memory, not ours, and the embedded
-        target is the one that cares. Receiving FEC has always worked and needs no
-        opt-in -- a peer may already be sending it (§7.2.2 makes coping with repeats
-        a receiver `shall`), which is a separate thing from whether we send it.
+          - FEC (§7.2.2) repeats the most recent setFecRepeats() of them in every new
+            datagram. Defaults to 2, the spec's recommendation.
+          - Retransmit (§7.2.3) answers a peer's request from anything still held, so
+            a longer history can satisfy older requests.
+
+        No slots (the default) disables both: we send no FEC repeats, and a Retransmit
+        Request gets a Retransmit Error because the buffer is empty. Off by default
+        because it is the caller's memory and the embedded target is the one that
+        cares -- RECEIVING FEC has always worked and needs no opt-in, since a peer may
+        send repeats whatever we do (§7.2.2 makes coping with them a receiver `shall`).
     */
-    void setFecSlots (FecSlot* slots, std::uint8_t count) noexcept
+    void setSentUmpHistory (SentUmpSlot* slots, std::uint8_t count) noexcept
     {
-        fecSlots    = slots;
-        fecCapacity = (slots != nullptr) ? count : std::uint8_t (0);
-        fecUsed     = 0;
+        history         = slots;
+        historyCapacity = (slots != nullptr) ? count : std::uint8_t (0);
+        historyUsed     = 0;
+        if (fecRepeats > historyCapacity)
+            fecRepeats = historyCapacity;
+    }
+
+    /*  How many recent commands to prepend to each datagram for FEC (§7.2.2).
+        Clamped to the history length. 0 keeps the history for Retransmit only and
+        sends no repeats. */
+    void setFecRepeats (std::uint8_t repeats) noexcept
+    {
+        fecRepeats = (repeats < historyCapacity) ? repeats : historyCapacity;
     }
 
     State state() const noexcept { return st; }
@@ -274,6 +311,7 @@ public:
             if (now - lastPingMs >= timing.pingIntervalMs)
                 sendPing();
             declareIdleIfDue (now);
+            requestRetransmitIfDue (now);
             if (now - lastRxMs >= timing.timeoutMs)
                 close (ByeReason::timeout);
         }
@@ -390,6 +428,8 @@ private:
             case Command::bye:
             case Command::byeReply:
             case Command::nak:
+            case Command::retransmitRequest:
+            case Command::retransmitError:
                 return true;
             default:
                 return false;
@@ -419,8 +459,13 @@ private:
             return true;
         }
 
-        // §7.1: UMP Data outside an Established Session -> Bye reason 0x05.
-        if (c.code == Command::umpData && ! (fromPeer && st == State::established))
+        /* §7.1 for UMP Data, and §7.2.3 / §7.2.4 say the same of both Retransmit
+         * commands: received "outside of an Established Session... shall respond with
+         * a Bye Command with reason 0x05". Same rule, same three commands. */
+        const bool needsSession = (c.code == Command::umpData
+                                   || c.code == Command::retransmitRequest
+                                   || c.code == Command::retransmitError);
+        if (needsSession && ! (fromPeer && st == State::established))
         {
             sendByeTo (from, ByeReason::sessionNotEstablished);
             return true;
@@ -457,7 +502,9 @@ private:
             case Command::umpData:                 onUmpData (c);          break;
             case Command::bye:                     onBye (from, fromPeer); break;
             case Command::byeReply:                onByeReply();           break;
-            case Command::nak:                     onNak();                break;
+            case Command::nak:                     onNak (c);              break;
+            case Command::retransmitRequest:       onRetransmitRequest (c); break;
+            case Command::retransmitError:         onRetransmitError();     break;
             default:                               break; // ignore for Phase 1
         }
     }
@@ -611,6 +658,20 @@ private:
 
         if (ahead < 0x8000u)                    // newer: slide the window forward
         {
+            /* A jump of more than one means the numbers in between never arrived
+             * (§5.6: "the Sequence Number can be used to detect duplicate, unordered,
+             * and missing UMP Data Commands"). Remember the first of them. One gap is
+             * tracked at a time, the oldest, because asking for that one asks for
+             * everything after it too -- a Retransmit Request means "send all
+             * previously sent UMP Data Commands starting from Sequence Number". */
+            if (ahead > 1 && ! gapPending)
+            {
+                gapPending         = true;
+                gapSeq             = std::uint16_t (lastRx + 1);
+                gapSinceMs         = plat.clock->nowMs();
+                retransmitRequests = 0;
+            }
+
             rxWindow = (ahead >= kRxWindowBits) ? std::uint64_t (0)
                                                 : std::uint64_t (rxWindow << ahead);
             rxWindow |= std::uint64_t (1);
@@ -628,6 +689,21 @@ private:
 
         rxWindow |= bit;
         return true;
+    }
+
+    // Has this Sequence Number already been processed? Anything older than the
+    // window counts as seen -- we can no longer tell, and re-requesting it would be
+    // worse than assuming.
+    bool hasSeen (std::uint16_t seq) const noexcept
+    {
+        if (! haveRx)
+            return false;
+        const std::uint16_t behind = std::uint16_t (lastRx - seq);
+        if (behind >= 0x8000u)
+            return false;                       // ahead of us; not yet seen
+        if (behind >= kRxWindowBits)
+            return true;                        // fell out of the window
+        return (rxWindow & (std::uint64_t (1) << behind)) != 0;
     }
 
     void onUmpData (const ParsedCommand& c) noexcept
@@ -683,7 +759,159 @@ private:
             setState (State::closed);
     }
 
-    void onNak() noexcept
+    /*  Serve a peer's Retransmit Request from the history (§7.2.3).
+
+        The spec contradicts itself about what to do when only SOME of the requested
+        range survives. §7.2.3: "All UMP Data Commands that are available in the
+        retransmit buffer following the missing packets should still be
+        retransmitted." §7.2.4: "The Device shall not retransmit other available UMP
+        Data Commands." Those cannot both be followed.
+
+        We follow §7.2.3, the more specific of the two and the only one that helps:
+        sending what survived costs one datagram the requester's dedup window will
+        sort out, while withholding it loses data that was right there. PROTOCOL.md
+        §5.4 records the conflict so the choice is visible rather than accidental.
+    */
+    void onRetransmitRequest (const ParsedCommand& c) noexcept
+    {
+        const std::uint16_t wanted = c.cmdSpecific;
+
+        if (historyUsed == 0)
+        {
+            // Nothing held at all. txSeq is the next number we will use, so it is
+            // the honest answer to "what is the earliest you could give me".
+            sendRetransmitError (RetransmitError::notInTransmitBuffer, txSeq);
+            return;
+        }
+
+        /* Search by stored order, not by comparing numbers: the history is in send
+         * order, so a range spanning the 0xFFFF -> 0x0000 wrap needs no special case.
+         * §7.2.3 warns about exactly this -- "the UMP Data Commands to be
+         * retransmitted could start with a high number close to the maximum, and then
+         * wrap around to 0x0000. The Sender should order the Retransmit buffer
+         * considering this wrap-around." Insertion order already does. */
+        std::uint8_t start = historyUsed;
+        for (std::uint8_t i = 0; i < historyUsed; ++i)
+            if (history[i].seq == wanted)
+            {
+                start = i;
+                break;
+            }
+
+        if (start < historyUsed)
+        {
+            retransmitFrom (start);
+            return;
+        }
+
+        // Not held. Table 31's Sequence Number field is "the first UMP Data Command
+        // that could be retransmitted", so name the oldest we still have.
+        sendRetransmitError (RetransmitError::notInTransmitBuffer, history[0].seq);
+
+        /* Then §7.2.3's "still retransmit what follows". Only meaningful if the
+         * request is for something OLDER than our oldest, in which case the whole
+         * buffer follows the gap. A request for a number we have not sent yet gets
+         * the error alone. Wrap-safe 16-bit comparison. */
+        const std::uint16_t oldestAhead = std::uint16_t (history[0].seq - wanted);
+        if (oldestAhead != 0 && oldestAhead < 0x8000u)
+            retransmitFrom (0);
+    }
+
+    // Send history[start..] as UMP Data, splitting across datagrams at the 1400-byte
+    // limit. "The sending entity should always send all requested UMP Data Commands
+    // without any gaps" (§7.2.3), so this never skips one to make things fit.
+    void retransmitFrom (std::uint8_t start) noexcept
+    {
+        std::uint8_t buf[kMaxDatagram];
+        Writer w (buf, sizeof buf);
+        if (! w.writeSignature())
+            return;
+        int packed = 0;
+
+        for (std::uint8_t i = start; i < historyUsed; ++i)
+        {
+            const std::size_t sz = kHeaderBytes + std::size_t (history[i].wordCount) * 4;
+            if (packed > 0 && w.size() + sz > kMaxDatagram)
+            {
+                if (w.ok())
+                    plat.socket->send (peer, buf, w.size());
+                w = Writer (buf, sizeof buf);
+                if (! w.writeSignature())
+                    return;
+                packed = 0;
+            }
+            if (! writeUmpData (w, history[i].seq, history[i].words, history[i].wordCount))
+                break;
+            ++packed;
+        }
+
+        if (packed > 0 && w.ok())
+            plat.socket->send (peer, buf, w.size());
+    }
+
+    void sendRetransmitError (RetransmitError reason, std::uint16_t firstAvailable) noexcept
+    {
+        sendOne ([&] (Writer& w) { return writeRetransmitError (w, reason, firstAvailable); });
+    }
+
+    /*  The peer cannot give us what we asked for (§7.2.4). "the requested UMP data is
+        probably lost and cannot be retrieved" -- so stop asking and tell the
+        application, which is the only layer that knows whether a missing note matters
+        enough to warrant an all-notes-off. */
+    void onRetransmitError() noexcept
+    {
+        abandonGap();
+    }
+
+    void abandonGap() noexcept
+    {
+        if (! gapPending)
+            return;
+        gapPending = false;
+        if (listener)
+            listener->onUmpLost (gapSeq);
+    }
+
+    /*  Ask for the gap, once the short settling delay has passed (§7.2.3).
+
+        The delay is not politeness: "That will help recovering from out of order
+        packets and it prevents sending Retransmit Requests too often." Most gaps on a
+        LAN are reordering, and most of the rest are filled by the FEC repeat in the
+        next datagram before this timer ever fires -- so the common case costs nothing
+        on the wire. */
+    void requestRetransmitIfDue (std::uint32_t now) noexcept
+    {
+        if (! gapPending)
+            return;
+
+        if (hasSeen (gapSeq))          // arrived on its own, or via FEC
+        {
+            gapPending = false;
+            return;
+        }
+
+        if (! peerDoesRetransmit)      // it NAKed us; §7.2.3 says stop asking
+        {
+            abandonGap();
+            return;
+        }
+
+        if (retransmitRequests >= timing.retransmitMaxRequests)
+        {
+            abandonGap();
+            return;
+        }
+
+        const std::uint32_t due = timing.retransmitDelayMs << retransmitRequests;
+        if (now - gapSinceMs < due)
+            return;
+
+        gapSinceMs = now;
+        ++retransmitRequests;
+        sendOne ([&] (Writer& w) { return writeRetransmitRequest (w, gapSeq, 0); });
+    }
+
+    void onNak (const ParsedCommand& c) noexcept
     {
         // The peer rejected something we sent under the assumption that we were
         // Established -- almost always UMP_DATA after the peer restarted and has no
@@ -698,6 +926,26 @@ private:
         // Re-inviting is safe even if the NAK was actually about something else
         // (host role sends none today, so in practice this only fires for a
         // client): worst case is one extra, harmless handshake round-trip.
+        /* A NAK echoes the header of the command it is complaining about (§6.15), so
+         * read it before reacting. A NAK of our Retransmit Request means only that
+         * the peer does not implement Retransmit -- §7.2.3: "it shall reply to the
+         * Retransmit Request Command with a NAK Command with reason 0x01... The
+         * remote Device should not send Retransmit Request Commands after that."
+         *
+         * Without this check the generic handler below would tear down a perfectly
+         * healthy session and re-invite, because we asked a question the peer does
+         * not answer. Stop asking instead. */
+        if (c.payload != nullptr && c.payloadWords >= 1)
+        {
+            const Command offending = Command (std::uint8_t (get32 (c.payload) >> 24));
+            if (offending == Command::retransmitRequest)
+            {
+                peerDoesRetransmit = false;
+                abandonGap();
+                return;
+            }
+        }
+
         if (role == Role::client && st == State::established)
         {
             setState (State::idle);
@@ -721,22 +969,27 @@ private:
     */
     void prependFecRepeats (Writer& w, std::size_t reserveBytes) noexcept
     {
-        if (fecUsed == 0)
+        if (historyUsed == 0 || fecRepeats == 0)
             return;
 
-        std::uint8_t first = fecUsed;
+        // Only the most recent fecRepeats entries are FEC material; the rest of the
+        // history exists to answer Retransmit Requests, not to pad every datagram.
+        const std::uint8_t oldest = (historyUsed > fecRepeats)
+                                        ? std::uint8_t (historyUsed - fecRepeats)
+                                        : std::uint8_t (0);
+        std::uint8_t first = historyUsed;
         std::size_t  used  = 0;
-        for (std::uint8_t i = fecUsed; i-- > 0; )
+        for (std::uint8_t i = historyUsed; i-- > oldest; )
         {
-            const std::size_t sz = kHeaderBytes + std::size_t (fecSlots[i].wordCount) * 4;
+            const std::size_t sz = kHeaderBytes + std::size_t (history[i].wordCount) * 4;
             if (w.size() + used + sz + reserveBytes > kMaxDatagram)
                 break;
             used  += sz;
             first  = i;
         }
 
-        for (std::uint8_t i = first; i < fecUsed; ++i)
-            writeUmpData (w, fecSlots[i].seq, fecSlots[i].words, fecSlots[i].wordCount);
+        for (std::uint8_t i = first; i < historyUsed; ++i)
+            writeUmpData (w, history[i].seq, history[i].words, history[i].wordCount);
     }
 
     /*  Keep this command for repeating in later datagrams. A FIFO: oldest drops out.
@@ -748,17 +1001,17 @@ private:
     */
     void retainForFec (std::uint16_t seq, const std::uint32_t* words, std::uint8_t count) noexcept
     {
-        if (fecCapacity == 0 || count == 0)
+        if (historyCapacity == 0 || count == 0)
             return;
 
-        if (fecUsed == fecCapacity)
+        if (historyUsed == historyCapacity)
         {
-            for (std::uint8_t i = 1; i < fecUsed; ++i)
-                fecSlots[i - 1] = fecSlots[i];
-            --fecUsed;
+            for (std::uint8_t i = 1; i < historyUsed; ++i)
+                history[i - 1] = history[i];
+            --historyUsed;
         }
 
-        FecSlot& slot = fecSlots[fecUsed++];
+        SentUmpSlot& slot = history[historyUsed++];
         slot.seq       = seq;
         slot.wordCount = count;
         for (std::uint8_t i = 0; i < count; ++i)
@@ -805,7 +1058,7 @@ private:
          * Sender is currently using". So the first few declarations carry the
          * repeats -- giving the last real commands extra chances precisely when no
          * new traffic will -- and the later, sparser ones go out bare. */
-        if (idleSent < fecCapacity)
+        if (idleSent < fecRepeats)
             prependFecRepeats (w, kHeaderBytes);
 
         if (! (writeUmpData (w, txSeq, nullptr, 0) && w.ok()))
@@ -916,9 +1169,16 @@ private:
     std::uint64_t     rxWindow = 0;    // bit i => (lastRx - i) already processed
 
     std::uint32_t     lastRxMs = 0, lastPingMs = 0, lastInviteMs = 0, pingId = 0;
-    FecSlot*          fecSlots = nullptr;      // caller-owned; null = FEC sending off
-    std::uint8_t      fecCapacity = 0;         // how many repeats (§7.2.2)
-    std::uint8_t      fecUsed = 0;             // how many slots currently hold data
+    SentUmpSlot*      history = nullptr;      // caller-owned; null = FEC sending off
+    std::uint8_t      historyCapacity = 0;    // retransmit depth (§7.2.3)
+    std::uint8_t      historyUsed = 0;         // how many slots currently hold data
+    std::uint8_t      fecRepeats = 2;          // how many to prepend (§7.2.2)
+
+    bool              gapPending = false;      // a Sequence Number we are missing
+    std::uint16_t     gapSeq = 0;
+    std::uint32_t     gapSinceMs = 0;
+    std::uint8_t      retransmitRequests = 0;  // how many times we have asked
+    bool              peerDoesRetransmit = true;  // until it NAKs us (§7.2.3)
 
     std::uint32_t     lastUmpTxMs = 0;         // last UMP Data we sent (§7.2.1)
     bool              haveSentUmp = false;     // ...of non-zero length, ever

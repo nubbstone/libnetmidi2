@@ -51,5 +51,10 @@ if(NOT NETMIDI2_SKIP_TESTS)
         add_executable(nm2_fec_sending tests/fec_sending.cpp)
         target_link_libraries(nm2_fec_sending PRIVATE netmidi2)
         add_test(NAME nm2_fec_sending COMMAND nm2_fec_sending)
+
+        # Retransmit (spec 7.2.3 / 7.2.4) — serving requests, asking, NAK handling.
+        add_executable(nm2_retransmit tests/retransmit.cpp)
+        target_link_libraries(nm2_retransmit PRIVATE netmidi2)
+        add_test(NAME nm2_retransmit COMMAND nm2_retransmit)
     endif()
 endif()

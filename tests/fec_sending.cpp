@@ -160,8 +160,8 @@ int main()
 
     //-- two repeats, oldest first --------------------------------------------
     std::puts ("\nTwo repeats, prepended oldest-first");
-    FecSlot slots[2];
-    sender.setFecSlots (slots, 2);
+    SentUmpSlot slots[2];
+    sender.setSentUmpHistory (slots, 2);
     {
         drain();
         std::uint32_t m[2] = { 0x40904000u, 0x22220000u };
@@ -205,8 +205,8 @@ int main()
         Session::Timing rt; rt.idleDeclareCount = 0; rt.pingIntervalMs = 100000;
         host.setTiming (rt); cli.setTiming (rt);
 
-        FecSlot cliSlots[2];
-        cli.setFecSlots (cliSlots, 2);
+        SentUmpSlot cliSlots[2];
+        cli.setSentUmpHistory (cliSlots, 2);
 
         host.listen();
         Endpoint hEp {}; std::strcpy (hEp.address, "127.0.0.1"); hEp.port = aPort;
@@ -230,8 +230,8 @@ int main()
     //-- repeats must not push a datagram past 1400 bytes ---------------------
     std::puts ("\nThe 1400-byte limit wins over the repeats");
     {
-        FecSlot big[5];
-        sender.setFecSlots (big, 5);
+        SentUmpSlot big[5];
+        sender.setSentUmpHistory (big, 5);
         drain();
 
         std::uint32_t maxUmp[kMaxUmpWordsPerCommand];
@@ -266,7 +266,7 @@ int main()
         check (d.commands >= 1 && d.words[d.commands - 1] == kMaxUmpWordsPerCommand,
                "...and the NEW command is never the one sacrificed");
 
-        sender.setFecSlots (slots, 2);
+        sender.setSentUmpHistory (slots, 2);
     }
 
     //-- idle declarations carry the repeats, then stop -----------------------
@@ -282,8 +282,8 @@ int main()
         it.pingIntervalMs = 100000; it.timeoutMs = 600000;
         it.idleDeclareMs = 40; it.idleDeclareCount = 5;
         idler.setTiming (it);
-        FecSlot iSlots[2];
-        idler.setFecSlots (iSlots, 2);
+        SentUmpSlot iSlots[2];
+        idler.setSentUmpHistory (iSlots, 2);
         idler.listen();
 
         Endpoint iEp {}; std::strcpy (iEp.address, "127.0.0.1"); iEp.port = iPort;

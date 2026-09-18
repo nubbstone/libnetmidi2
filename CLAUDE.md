@@ -90,7 +90,8 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
                    host_multiclient.cpp    — one Host port, several Clients (§3.2)
                    discovery.cpp           — mDNS contract + limits, fake adapter (§4)
                    fec_sending.cpp         — FEC repeat order, size cap, idle (§7.2.2)
-CMakeLists.txt     INTERFACE target `netmidi2` + all six tests (add_test)
+                   retransmit.cpp          — request/serve/NAK handling (§7.2.3–7.2.4)
+CMakeLists.txt     INTERFACE target `netmidi2` + all seven tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT, © Nubbstone
@@ -121,10 +122,10 @@ LICENSE            MIT, © Nubbstone
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # all six suites
+ctest --test-dir build --output-on-failure     # all seven suites
 ```
 
-Six suites:
+Seven suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
@@ -145,6 +146,10 @@ Six suites:
   prepended oldest‑first with the new command last, the oldest dropped rather than
   bursting 1400 bytes, a round trip proving our own receiver deduplicates what our
   sender emits, and the idle‑period interaction with §7.2.1.
+- **`nm2_retransmit`** (integration, POSIX). §7.2.3–7.2.4: serving a request from the
+  history, Retransmit Error when it has aged out, Bye `0x05` with no session, gap
+  detection and bounded re‑asking, and that a NAK of our request stops the asking
+  without tearing the session down.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
@@ -189,12 +194,20 @@ Invitation: it expires into a Bye and Pending Bye rather than retrying forever
 (§6.2). `State` gained `closing` between `established` and `closed`, so a consumer
 switching exhaustively over it will need a new arm.
 
-**FEC sending is opt‑in; FEC receiving is not.** `setFecSlots()` lends the Session
-caller‑owned storage for recently sent commands — a slot is sized for the largest
-legal command, so a Session that does not want the memory pays none of it. Receiving
-repeats has no switch and never did: §7.2.2 makes coping with them a receiver
-`shall`, because the peer may send them whatever we do. When touching this, the rule
-that looks like style and is not: repeats go **oldest‑first, new command last**.
+**One history, two features.** `setSentUmpHistory()` lends the Session caller‑owned
+storage for recently sent commands; `setFecRepeats()` says how many of those get
+prepended to each datagram. FEC (§7.2.2) wants two; Retransmit (§7.2.3) answers
+requests from the whole array, so a deeper history serves older requests. A slot is
+sized for the largest legal command, so a Session that opts out pays nothing.
+Receiving FEC repeats has no switch and never did — §7.2.2 makes coping with them a
+receiver `shall`, since the peer may send them whatever we do. When touching FEC, the
+rule that looks like style and is not: repeats go **oldest‑first, new command last**.
+
+**A NAK is not automatically a session problem.** `onNak` reads the echoed command
+header (§6.15) before reacting. A NAK of our Retransmit Request means only that the
+peer does not implement Retransmit; the generic "re‑invite" response would tear down
+a healthy session for asking a question. Any new command we send needs the same
+thought before it inherits the default.
 
 **Discovery is a contract here, not an implementation.** `Discovery.h` has no mDNS
 responder and must not grow one — multicast, record encoding and a TTL cache are
@@ -232,7 +245,7 @@ explicit `host:port`.
 |---|---|
 | ~~mDNS discovery contract + orchestration~~ | **done** (`Discovery.h`; the responder itself is adapter work) |
 | ~~FEC sending~~ (receiving always worked) | **done** (`Session::setFecSlots`) |
-| Retransmit (`0x80` Request / `0x81` Error, §7.2.3–7.2.4) | planned |
+| ~~Retransmit (`0x80`/`0x81`)~~ | **done** (shares the sent‑UMP history with FEC) |
 | Authentication (Invitation with Auth `0x02`/`0x03`, nonce/sha256) | planned |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
