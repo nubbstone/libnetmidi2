@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "Auth.h"
 #include "Discovery.h"
 
 namespace netmidi2
@@ -71,7 +72,8 @@ struct Platform
 {
     IUdpSocket* socket    = nullptr;
     IClock*     clock     = nullptr;
-    IDiscovery* discovery = nullptr; // may be null in explicit-address mode
+    IDiscovery* discovery = nullptr; // null = explicit-address mode, no mDNS
+    ICrypto*    crypto    = nullptr; // null = no authentication (Auth.h)
 };
 
 } // namespace netmidi2

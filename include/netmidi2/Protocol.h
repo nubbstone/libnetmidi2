@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "Auth.h"
+
 namespace netmidi2
 {
 
@@ -269,6 +271,84 @@ inline bool writeBye (Writer& w, ByeReason reason) noexcept
 inline bool writeByeReply (Writer& w) noexcept
 {
     return w.writeHeader (Command::byeReply, 0, 0);
+}
+
+/*  Invitation with Authentication (§6.9, Table 18). pl = 8, csd = 0 (Reserved),
+    payload = the 32-byte SHA-256 digest. Clean table, nothing to interpret. */
+inline bool writeInvitationWithAuth (Writer& w,
+                                     const std::uint8_t digest[kAuthDigestBytes]) noexcept
+{
+    return w.writeHeader (Command::invitationWithAuth, 8, 0)
+        && w.raw (digest, kAuthDigestBytes);
+}
+
+/*  Invitation with User Authentication (§6.10, Table 19). pl = 8..255, csd = 0,
+    payload = 32-byte digest followed by the username (UTF-8), padded to a word. */
+inline bool writeInvitationWithUserAuth (Writer& w,
+                                         const std::uint8_t digest[kAuthDigestBytes],
+                                         const char* username, std::size_t usernameLen) noexcept
+{
+    const std::size_t userWords = (usernameLen + 3) / 4;
+    const std::size_t payloadWords = 8 + userWords;
+    if (payloadWords > 255)
+        return false;
+
+    return w.writeHeader (Command::invitationWithUserAuth, std::uint8_t (payloadWords), 0)
+        && w.raw (digest, kAuthDigestBytes)
+        && w.bytesPadded (username, usernameLen);
+}
+
+/*  Invitation Reply: Authentication Required (§6.7 Table 14) and its User variant
+    (§6.8 Table 16). Same shape; `code` selects which.
+
+        csd1           = length of the UMP Endpoint Name, in 32-bit words
+        csd2           = Authentication State (Table 15 / 17)
+        payload        = 16-byte CryptoNonce, then the name, then the Product
+                         Instance Id, each padded to a word
+
+    THE TABLES ARE WRONG ABOUT THE LENGTHS, and this is the reading they actually
+    support. Their Size column gives the name as `(csd1*4) - 16` and the product id
+    as `(pl-csd1)*4 - 16`, which subtracts the 16-byte nonce twice and leaves the
+    payload 16 bytes short of the pl*4 it must occupy -- at pl=6 that is 8 bytes of
+    content in a 24-byte payload.
+
+    The Description column instead says csd1 is "Length, in 32-bit words, of the UMP
+    Endpoint Name", which with the nonce occupying the first 4 words gives
+    pl = 4 + nameWords + productWords. That is exactly self-consistent, and the
+    table's own stated ranges confirm it: minimum pl 6 = 4 + 1 + 1, and maximum
+    pl 40 = 4 + 25 + 11, with csd1 1..25 and a 42-byte Product Instance Id being
+    11 words. Neither number works under the Size-column reading.
+
+    Table 14 also lists Payload Length as 2 bytes, which cannot be: §5.4 Table 7
+    fixes every command header at 4 bytes as code(1) + pl(1) + csd(2).
+
+    PROTOCOL.md §3.7 records all of this. Flagged rather than quietly chosen, because
+    a peer that read the Size column literally will not interoperate, and when that
+    happens this is the first place to look.
+*/
+inline bool writeAuthRequired (Writer& w, Command code, AuthState state,
+                               const std::uint8_t nonce[kCryptoNonceBytes],
+                               const char* name, std::size_t nameLen,
+                               const char* productId, std::size_t productLen) noexcept
+{
+    if (code != Command::invitationReplyAuthReq
+        && code != Command::invitationReplyUserAuth)
+        return false;
+
+    const std::uint8_t nonceWords   = std::uint8_t (kCryptoNonceBytes / 4);   // 4
+    const std::uint8_t nameWords    = std::uint8_t ((nameLen    + 3) / 4);
+    const std::uint8_t productWords = std::uint8_t ((productLen + 3) / 4);
+    const std::size_t  payloadWords = std::size_t (nonceWords) + nameWords + productWords;
+    if (payloadWords > 255 || nameWords == 0)
+        return false;
+
+    const std::uint16_t csd = std::uint16_t ((std::uint16_t (nameWords) << 8)
+                                             | std::uint8_t (state));
+
+    return w.writeHeader (code, std::uint8_t (payloadWords), csd)
+        && w.raw (nonce, kCryptoNonceBytes)
+        && w.bytesPadded (name, nameLen)
+        && w.bytesPadded (productId, productLen);
 }
 
 /*  Retransmit Request (§7.2.3, Table 30). pl = 1.

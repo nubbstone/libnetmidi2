@@ -23,16 +23,17 @@ namespace netmidi2
 
 /*  Session states, in lifecycle order.
 
-    `inviting` is the spec's "Pending Invitation" and `closing` its "Pending Bye"
-    (§6.1): we have sent a Bye and are repeating it until the peer answers with a
-    Bye Reply or we give up. `closed` is ours rather than the spec's -- §6.3.1 has
+    `inviting` is the spec's "Pending Invitation", `authenticating` its
+    "Authentication Required" (§6.1) -- a challenge has been issued and both ends are
+    holding the CryptoNonce -- and `closing` its "Pending Bye": we have sent a Bye
+    and are repeating it until the peer answers with a Bye Reply or we give up. `closed` is ours rather than the spec's -- §6.3.1 has
     both ends return to Idle after a teardown, but a library is more useful if a
     finished Session stays finished and says so, instead of silently looking ready
     to accept the next stranger that comes along.
 
-    The auth and session-reset states (§6.1) are Phase 2/3 and absent.
+    Pending Session Reset (§6.1) is the one spec state still absent.
 */
-enum class State { idle, inviting, established, closing, closed };
+enum class State { idle, inviting, authenticating, established, closing, closed };
 enum class Role  { host, client };
 
 /*  One previously-sent UMP Data command, kept so it can be sent again.
@@ -52,6 +53,21 @@ struct SentUmpSlot
     std::uint16_t seq = 0;
     std::uint8_t  wordCount = 0;
     std::uint32_t words[kMaxUmpWordsPerCommand] = {};
+};
+
+/*  Where a Host looks up a user's password for §6.10 user authentication. Injected,
+    because a credential store is the consumer's business -- a keychain, a config
+    file, a hard-coded pair on an MCU -- and never the protocol library's.
+
+    Return false for an unknown user; §6.10 then has the Host answer with User
+    Authentication Required rather than revealing which half was wrong.
+*/
+class IUserPasswordStore
+{
+public:
+    virtual ~IUserPasswordStore() = default;
+    virtual bool lookupPassword (const char* username, char* passwordOut,
+                                 std::size_t capacity) = 0;
 };
 
 class ISessionListener
@@ -115,6 +131,12 @@ public:
             or we give up and report the loss. */
         std::uint32_t retransmitDelayMs = 10;
         std::uint8_t  retransmitMaxRequests = 3;
+
+        /*  §6.7: a Host "should delay sending the reply so that a brute force attack
+            will not be practical. A good approach is to start with a short delay
+            (e.g., 100ms) and double it for every subsequent failed authentication."
+            With a 4-digit PIN this delay IS the security -- the hash is not. */
+        std::uint32_t authFailDelayMs = 100;
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -123,6 +145,37 @@ public:
           name (endpointName), productId (productInstanceId) {}
 
     void setTiming (Timing t) noexcept { timing = t; }
+
+    /*  HOST: demand a shared secret before accepting anyone (§6.7/§6.9). Needs
+        Platform::crypto; without it nothing is demanded, because a Host that cannot
+        generate a real nonce must not pretend to authenticate. */
+    void requireAuthentication (const char* sharedSecret) noexcept
+    {
+        authSecret = sharedSecret;
+    }
+
+    /*  HOST: demand a username and password instead (§6.8/§6.10). The store is the
+        consumer's credential list. */
+    void requireUserAuthentication (IUserPasswordStore* store) noexcept
+    {
+        userStore = store;
+    }
+
+    /*  CLIENT: the secret to answer a challenge with. Also sets the Capabilities bit
+        in our Invitation -- §6.7 says a Host "shall only" challenge a Client that
+        advertised it can be challenged, so staying silent here means never being
+        asked. */
+    void setSharedSecret (const char* sharedSecret) noexcept
+    {
+        authSecret = sharedSecret;
+    }
+
+    // CLIENT: credentials for user authentication (§6.10).
+    void setUserCredentials (const char* username, const char* password) noexcept
+    {
+        authUsername = username;
+        authPassword = password;
+    }
 
     /*  Lend the Session somewhere to keep recently sent UMP Data commands. This one
         array powers both resend features, and `count` is how deep it goes:
@@ -288,6 +341,9 @@ public:
     {
         const std::uint32_t now = plat.clock->nowMs();
 
+        if (st == State::authenticating)
+            releaseAuthReplyIfDue (now);
+
         if (st == State::inviting)
         {
             /* §6.2: a repeated Command is not repeated forever. "If a Device reaches
@@ -331,7 +387,21 @@ public:
 private:
     void setState (State s) noexcept
     {
-        if (s != st) { st = s; if (listener) listener->onStateChanged (s); }
+        if (s == st)
+            return;
+
+        /* §6.7: "Every new Session shall use a new CryptoNonce, even for the same
+         * Client." Dropping it whenever a session ends is what guarantees that --
+         * reusing one would let a replayed digest open a second session. */
+        if (s == State::closed || s == State::idle)
+        {
+            haveNonce    = false;
+            authReplyDue = false;
+        }
+
+        st = s;
+        if (listener)
+            listener->onStateChanged (s);
     }
 
     void touch() noexcept { lastRxMs = plat.clock->nowMs(); }
@@ -348,7 +418,8 @@ private:
     // door and every close would have to wait out its full timeout.
     bool isFromPeer (const Endpoint& from) const noexcept
     {
-        return (st == State::inviting || st == State::established || st == State::closing)
+        return (st == State::inviting || st == State::authenticating
+                || st == State::established || st == State::closing)
                && from == peer;
     }
 
@@ -409,6 +480,10 @@ private:
         return code == Command::invitation
             || code == Command::bye
             || code == Command::invitationReplyAccepted
+            || code == Command::invitationWithAuth
+            || code == Command::invitationWithUserAuth
+            || code == Command::invitationReplyAuthReq
+            || code == Command::invitationReplyUserAuth
             || code == Command::ping;
     }
 
@@ -430,6 +505,10 @@ private:
             case Command::nak:
             case Command::retransmitRequest:
             case Command::retransmitError:
+            case Command::invitationWithAuth:
+            case Command::invitationWithUserAuth:
+            case Command::invitationReplyAuthReq:
+            case Command::invitationReplyUserAuth:
                 return true;
             default:
                 return false;
@@ -495,8 +574,12 @@ private:
 
         switch (c.code)
         {
-            case Command::invitation:              onInvitation (from);    break;
+            case Command::invitation:              onInvitation (c, from); break;
             case Command::invitationReplyAccepted: onInvitationAccepted (from, fromPeer); break;
+            case Command::invitationReplyAuthReq:  onAuthRequired (c, from, false); break;
+            case Command::invitationReplyUserAuth: onAuthRequired (c, from, true);  break;
+            case Command::invitationWithAuth:      onInvitationWithAuth (c, from, false); break;
+            case Command::invitationWithUserAuth:  onInvitationWithAuth (c, from, true);  break;
             case Command::ping:                    onPing (c, from);       break;
             case Command::pingReply:               onPingReply (c);        break;
             case Command::umpData:                 onUmpData (c);          break;
@@ -510,14 +593,22 @@ private:
     }
 
     //== per-command handlers =================================================
-    void onInvitation (const Endpoint& from) noexcept
+    void onInvitation (const ParsedCommand& c, const Endpoint& from) noexcept
     {
         if (role != Role::host)
             return;
 
         if (st != State::established)
         {
-            peer = from;
+            peer     = from;
+            peerCaps = c.data2();          // §6.4 Table 11
+
+            if (authRequired())
+            {
+                beginAuthentication (from);
+                return;
+            }
+
             sendInvitationAccepted();
             setState (State::established);
             return;
@@ -544,10 +635,209 @@ private:
             sendInvitationAccepted();
     }
 
+    bool authRequired() const noexcept
+    {
+        // Without crypto we cannot make a nonce, and §6.7 needs one. A Host in that
+        // position must not pretend to authenticate -- it accepts, or it is
+        // configured not to listen at all.
+        if (plat.crypto == nullptr)
+            return false;
+        return authSecret != nullptr || userStore != nullptr;
+    }
+
+    /*  Issue the challenge (§6.7 / §6.8).
+
+        The Client only gets asked if it said it could answer (§6.4 Table 11). If it
+        cannot, §6.4 is explicit about the outcome: "If the Host does not support
+        Pending Invitation fallback and requires Authentication, and the Client does
+        not support a matching Authentication method, then the Host shall send a Bye
+        Command with reason 0x45 (No Matching Authentication Method)."
+    */
+    void beginAuthentication (const Endpoint& from) noexcept
+    {
+        const bool wantUser = (userStore != nullptr);
+        const std::uint8_t needed = wantUser ? kCapInvitationWithUserAuth
+                                             : kCapInvitationWithAuth;
+
+        if ((peerCaps & needed) == 0)
+        {
+            sendByeTo (from, ByeReason::noMatchingAuth);
+            return;
+        }
+
+        /* §6.7: "Upon receiving duplicate Invitation Commands from the same Client,
+         * the Host should reply with the same CryptoNonce" -- so only mint one if we
+         * are not already mid-challenge. "Every new Session shall use a new
+         * CryptoNonce, even for the same Client" is handled by clearing it whenever
+         * a session ends. */
+        if (! haveNonce)
+        {
+            if (! makeCryptoNonce (*plat.crypto, nonce))
+                return;                     // no entropy: say nothing rather than
+            haveNonce = true;               // issue a guessable challenge
+        }
+
+        authReplyUser  = wantUser;
+        authReplyState = AuthState::firstRequest;
+        sendAuthChallenge();
+        setState (State::authenticating);
+    }
+
+    void sendAuthChallenge() noexcept
+    {
+        const Command code = authReplyUser ? Command::invitationReplyUserAuth
+                                           : Command::invitationReplyAuthReq;
+        const AuthState state = authReplyState;
+        sendOne ([&] (Writer& w) {
+            return writeAuthRequired (w, code, state, nonce,
+                                      name, cstrlen (name), productId, cstrlen (productId));
+        });
+    }
+
+    /*  CLIENT: a challenge arrived (§6.7 / §6.8). Hash the nonce with our secret and
+        answer. §6.7 also says a Client that never sent an Invitation must NAK this
+        with reason 0x02 (Command Not Expected), and a Host receiving one must do the
+        same -- it is a Host-to-Client command and has no business arriving here.
+    */
+    void onAuthRequired (const ParsedCommand& c, const Endpoint& from, bool userVariant) noexcept
+    {
+        if (role != Role::client
+            || ! (st == State::inviting || st == State::authenticating))
+        {
+            sendNakTo (from, NakReason::commandNotExpected, c);
+            return;
+        }
+
+        if (plat.crypto == nullptr || c.payload == nullptr
+            || c.payloadWords < (kCryptoNonceBytes / 4))
+            return;
+
+        for (std::size_t i = 0; i < kCryptoNonceBytes; ++i)
+            nonce[i] = c.payload[i];
+        haveNonce = true;
+        setState (State::authenticating);
+
+        std::uint8_t digest[kAuthDigestBytes];
+        if (userVariant)
+        {
+            if (authUsername == nullptr || authPassword == nullptr)
+                return;
+            if (! makeUserAuthDigest (*plat.crypto, nonce, authUsername, authPassword, digest))
+                return;
+            const char* user = authUsername;
+            sendOne ([&] (Writer& w) {
+                return writeInvitationWithUserAuth (w, digest, user, cstrlen (user));
+            });
+        }
+        else
+        {
+            if (authSecret == nullptr)
+                return;
+            if (! makeAuthDigest (*plat.crypto, nonce, authSecret, digest))
+                return;
+            sendOne ([&] (Writer& w) { return writeInvitationWithAuth (w, digest); });
+        }
+    }
+
+    /*  HOST: the Client answered the challenge (§6.9 / §6.10). Recompute and compare.
+
+        A digest arriving with no challenge outstanding gets Bye 0x41 -- §6.9: "If the
+        Host receives an Invitation with Authentication Command but has not received a
+        prior Invitation Command, then the Host should terminate this Invitation with
+        a Bye Command with reason 0x41".
+    */
+    void onInvitationWithAuth (const ParsedCommand& c, const Endpoint& from, bool userVariant) noexcept
+    {
+        if (role != Role::host || plat.crypto == nullptr)
+            return;
+
+        if (! haveNonce || st != State::authenticating || ! (from == peer))
+        {
+            sendByeTo (from, ByeReason::authRejectedNoPrior);
+            return;
+        }
+
+        if (c.payload == nullptr || c.payloadWords < (kAuthDigestBytes / 4))
+            return;
+
+        std::uint8_t expected[kAuthDigestBytes];
+        bool haveExpected = false;
+
+        if (userVariant)
+        {
+            // Username follows the digest, padded to a word (§6.10 Table 19).
+            char user[kMaxUsernameBytes + 1] = {};
+            const std::size_t userBytes = std::size_t (c.payloadWords) * 4 - kAuthDigestBytes;
+            std::size_t n = 0;
+            for (; n < userBytes && n < kMaxUsernameBytes; ++n)
+            {
+                const char ch = char (c.payload[kAuthDigestBytes + n]);
+                if (ch == '\0') break;
+                user[n] = ch;
+            }
+            user[n] = '\0';
+
+            char password[kMaxSharedSecretBytes + 1] = {};
+            if (userStore != nullptr && n > 0
+                && userStore->lookupPassword (user, password, sizeof password))
+                haveExpected = makeUserAuthDigest (*plat.crypto, nonce, user, password, expected);
+            // An unknown user falls through to the same failure path as a wrong
+            // password, deliberately: §6.10 has the Host answer User Authentication
+            // Required either way, which is also what stops it being a user oracle.
+        }
+        else if (authSecret != nullptr)
+        {
+            haveExpected = makeAuthDigest (*plat.crypto, nonce, authSecret, expected);
+        }
+
+        if (haveExpected && digestsEqual (expected, c.payload))
+        {
+            authFailures = 0;
+            authReplyDue = false;
+            sendInvitationAccepted();
+            setState (State::established);
+            return;
+        }
+
+        /* §6.7: "the Host should delay sending the reply so that a brute force attack
+         * will not be practical. A good approach is to start with a short delay (e.g.
+         * 100ms) and double it for every subsequent failed authentication." The
+         * challenge is queued, not sent, and tickTimers releases it. */
+        authReplyState = AuthState::digestIncorrect;
+        authReplyUser  = userVariant;
+        authReplyDue   = true;
+        authReplyAtMs  = plat.clock->nowMs() + authFailureDelayMs();
+        if (authFailures < 16)
+            ++authFailures;
+    }
+
+    std::uint32_t authFailureDelayMs() const noexcept
+    {
+        const std::uint8_t shift = (authFailures < 8) ? authFailures : std::uint8_t (8);
+        return timing.authFailDelayMs << shift;
+    }
+
+    void releaseAuthReplyIfDue (std::uint32_t now) noexcept
+    {
+        if (! authReplyDue || (now - authReplyAtMs) >= 0x80000000u)
+            return;                          // not yet (wrap-safe compare)
+        authReplyDue = false;
+        sendAuthChallenge();
+    }
+
     void onInvitationAccepted (const Endpoint& from, bool fromPeer) noexcept
     {
-        // The normal case: our own pending invitation was accepted.
-        if (fromPeer && role == Role::client && st == State::inviting)
+        /*  The normal case: our own pending invitation was accepted.
+
+            `authenticating` counts as pending. §6.1 names it a separate state, but
+            §6.9 is clear that it is still the same outstanding invitation -- "After
+            an Invitation with Authentication Command is sent, the Invitation is
+            pending until a Bye Command or Invitation Reply is received." Omitting it
+            here meant a client that had just authenticated SUCCESSFULLY answered the
+            Accepted with Bye 0x06 "no pending session", killing the session at the
+            last step of the handshake it had just passed. */
+        if (fromPeer && role == Role::client
+            && (st == State::inviting || st == State::authenticating))
         {
             setState (State::established);
             return;
@@ -1104,10 +1394,29 @@ private:
         sendOneTo (peer, static_cast<Build&&> (build));
     }
 
+    /*  §6.4 Table 11: tell the Host which challenges we can answer. §6.7 makes this
+        load-bearing rather than informational -- a Host "shall only" send
+        Authentication Required "if the Client set the flag", so a Client that does
+        not advertise simply never gets asked, and a Host that requires a password
+        will Bye it with 0x45 instead. */
+    std::uint8_t ourCapabilities() const noexcept
+    {
+        std::uint8_t caps = 0;
+        if (plat.crypto != nullptr)
+        {
+            if (authSecret != nullptr)
+                caps = std::uint8_t (caps | kCapInvitationWithAuth);
+            if (authUsername != nullptr && authPassword != nullptr)
+                caps = std::uint8_t (caps | kCapInvitationWithUserAuth);
+        }
+        return caps;
+    }
+
     void sendInvitation() noexcept
     {
         lastInviteMs = plat.clock->nowMs();
-        sendOne ([&] (Writer& w) { return writeInvitation (w, 0x00, name, cstrlen (name), productId, cstrlen (productId)); });
+        const std::uint8_t caps = ourCapabilities();
+        sendOne ([&] (Writer& w) { return writeInvitation (w, caps, name, cstrlen (name), productId, cstrlen (productId)); });
     }
     void sendInvitationAccepted() noexcept
     {
@@ -1173,6 +1482,20 @@ private:
     std::uint8_t      historyCapacity = 0;    // retransmit depth (§7.2.3)
     std::uint8_t      historyUsed = 0;         // how many slots currently hold data
     std::uint8_t      fecRepeats = 2;          // how many to prepend (§7.2.2)
+
+    // Authentication (§6.7-6.10). All caller-owned strings; null = not configured.
+    const char*       authSecret = nullptr;    // host: required; client: our answer
+    const char*       authUsername = nullptr;  // client, user auth
+    const char*       authPassword = nullptr;
+    IUserPasswordStore* userStore = nullptr;   // host, user auth
+    std::uint8_t      nonce[kCryptoNonceBytes] = {};
+    bool              haveNonce = false;
+    std::uint8_t      peerCaps = 0;            // Capabilities from their Invitation
+    std::uint8_t      authFailures = 0;        // drives the brute-force backoff
+    bool              authReplyDue = false;    // a challenge held back deliberately
+    std::uint32_t     authReplyAtMs = 0;
+    AuthState         authReplyState = AuthState::firstRequest;
+    bool              authReplyUser = false;   // 0x13 rather than 0x12
 
     bool              gapPending = false;      // a Sequence Number we are missing
     std::uint16_t     gapSeq = 0;

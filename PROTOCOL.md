@@ -240,6 +240,67 @@ session with is precisely the one that would otherwise retransmit until it times
 out. Acknowledging is not accepting: only our own peer's Bye closes our session —
 letting any sender close it was a real bug (see the `stranger:` tests).
 
+### 3.7 Authentication — `0x02`/`0x03`, `0x12`/`0x13` (§6.7–6.10)
+
+A Host that wants a password answers an Invitation with a challenge carrying a
+16-byte **CryptoNonce**; the Client returns a 32-byte SHA-256 digest; the Host
+recomputes and compares. Only offered to a Client that advertised it can answer —
+§6.7: the challenge "shall only be sent if the Client set the flag" in the
+Capabilities field (§6.4 Table 11). A Host that requires auth and meets a Client that
+cannot do it sends **Bye `0x45`** (No Matching Authentication Method, §6.4).
+
+```
+digest       = SHA256(<CryptoNonce><SharedSecret>)              §6.9
+user digest  = SHA256(<CryptoNonce><Username><Password>)        §6.10
+```
+
+Both have **published worked examples** in the spec, checked byte-for-byte in
+`tests/auth.cpp`. They are the part that must be identical between implementations,
+and the one part of this chapter that needs no interpretation.
+
+| | |
+|---|---|
+| `0x02` Invitation with Authentication | pl 8, csd 0, payload = 32-byte digest (Table 18) |
+| `0x03` …with User Authentication | pl 8..255, csd 0, payload = digest + username (Table 19) |
+| `0x12` Reply: Authentication Required | csd1 = name words, csd2 = Auth State, payload = nonce + name + product id |
+| `0x13` …User Authentication Required | same shape as `0x12` |
+
+**The `0x12`/`0x13` tables are wrong about their lengths, and this is the reading
+they actually support.** Their Size column gives the name as `(csd1*4) - 16` and the
+product id as `(pl-csd1)*4 - 16`, subtracting the 16-byte nonce twice and leaving the
+payload 16 bytes short of the `pl*4` it must fill. The Description column instead
+calls csd1 "Length, in 32-bit words, of the UMP Endpoint Name", which with the nonce
+occupying the first 4 words gives `pl = 4 + nameWords + productWords`. That is exactly
+self-consistent, and the tables' own stated ranges confirm it: minimum `pl` 6 =
+4+1+1, maximum 40 = 4+25+11 (a 42-byte Product Instance Id is 11 words), with csd1
+1..25. Neither bound works under the Size-column reading. Table 14 also lists Payload
+Length as 2 bytes, which §5.4 Table 7 forbids — every command header is 4 bytes.
+
+**If a peer disagrees with us on `0x12`/`0x13` framing, this is the first place to
+look.** The digests are solid; the envelope around them is inference.
+
+**Security notes that are not optional.**
+
+- The **nonce** carries the security, not the hash. The spec's own example secret is
+  `5483` and it calls the shared secret "typically a 4- or 6-digit number", so the
+  digest is only ever as strong as a PIN. A predictable nonce lets an attacker
+  precompute and the PIN stops mattering. `ICrypto::randomBytes` returning false must
+  mean *no challenge is issued*, never a guessable one.
+- §6.7 requires the Host to **slow down failures**: "start with a short delay (e.g.,
+  100ms) and double it for every subsequent failed authentication". With a 4-digit
+  PIN that delay *is* the defence.
+- §6.7: "Every new Session shall use a new CryptoNonce, even for the same Client",
+  while duplicate Invitations *during one handshake* get the same nonce back.
+- Digest comparison must be **constant time**. `memcmp` returns at the first
+  differing byte, and how long a rejection takes then leaks how much was right —
+  enough, over retries, to recover a digest a byte at a time.
+- An unknown username and a wrong password take the **same** path (§6.10), so the
+  Host is not a user-enumeration oracle.
+
+No crypto is implemented in this library: SHA-256 and entropy arrive through
+`ICrypto` (Auth.h), so a platform can use CommonCrypto, mbedTLS, or a hardware SHA
+engine rather than whatever we would have hand-rolled.
+
 ### 3.6 NAK — `0x8F` (§6.15)
 
 ```
