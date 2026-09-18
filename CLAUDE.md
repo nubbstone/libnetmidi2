@@ -139,8 +139,8 @@ Three suites:
   NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, the §7.1 /
   §5.5 replies owed to a sender we have no session with, FEC repeats deduplicated
   across a 64‑entry window (including the `0xFFFF` wrap), an unanswered Invitation
-  expiring into Bye `0x04`, a Bye retransmitted until acknowledged, liveness timeout,
-  graceful Bye → Closed.
+  expiring into Bye `0x04`, a Bye retransmitted until acknowledged, zero‑length idle
+  declarations with their backoff (§7.2.1), liveness timeout, graceful Bye → Closed.
 
 **Replying vs accepting.** Several things are answered regardless of who sent them —
 an Invitation, a sessionless Ping, a Bye (always acknowledged, §6.16), an Invitation
@@ -153,6 +153,13 @@ an idle `Session` has no `peer`, and replying there sent Ping Replies to an empt
 endpoint for as long as that code existed. That distinction is load‑bearing; see the
 `stranger:`, `liveness:`, `spec-reply:` and `dup-accept:` checks, each of which
 exists because some part of it was once got wrong.
+
+**Answering is separate from liveness.** A Ping is answered in *any* state and from
+*anyone* (§6.1 Table 9, §6.13) — a Host busy with one Client that stayed silent looks
+dead to every other box on the LAN. That is only safe because `touch()` is gated on
+`fromPeer || sessionless`, so a stranger's Ping gets a reply without refreshing the
+idle timer. The two were once welded together, and refusing the Ping *was* how the
+timer was protected. Keep them apart; the `liveness:` checks are what prove it.
 
 **Careful with the "tell them" replies.** Each was added to stop a peer transmitting
 into silence — but a reply sent in the wrong state is worse than no reply. The

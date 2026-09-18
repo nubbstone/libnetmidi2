@@ -310,6 +310,7 @@ int main()
         const int hostRxBefore = hostRec.umpCount;
 
         // Pull one datagram off the stranger's socket and report its first command.
+        std::uint32_t lastWord0 = 0;
         auto recvFirst = [&] (Command& codeOut, std::uint8_t& data1Out) -> bool {
             std::uint8_t in[256]; Endpoint from;
             const int n = stranger.receive (in, sizeof in, from);
@@ -317,7 +318,10 @@ int main()
                 return false;
             bool got = false;
             parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
-                if (! got) { codeOut = c.code; data1Out = c.data1(); got = true; }
+                if (got) return;
+                codeOut = c.code; data1Out = c.data1();
+                lastWord0 = c.payload ? get32 (c.payload) : 0u;
+                got = true;
             });
             return got;
         };
@@ -350,12 +354,23 @@ int main()
                    "stranger: stray UMP_DATA is answered with Bye 0x05 (spec 7.1)");
         }
 
+        /* A Ping IS answered, whoever sends it. §6.1 Table 9 puts Ping in "Every
+         * State" and §6.13 lets anyone send one at any time -- it is how a peer
+         * checks we are alive before inviting. A host busy with one Client that
+         * stayed silent would look dead to every other box on the LAN.
+         *
+         * Answering is not accepting: the liveness timer must NOT be refreshed by
+         * this, which is what the `liveness:` checks below prove separately. Those
+         * two behaviours used to be welded together -- refusing the Ping was how the
+         * timer was protected -- and separating them is what makes this safe. */
         sendRaw ([] (Writer& w) { writePing (w, 0x99u); });
         pump (30);
         {
             Command code {}; std::uint8_t d1 = 0;
-            check (! recvFirst (code, d1),
-                   "stranger: Ping into an established session is NOT answered");
+            const bool got = recvFirst (code, d1);
+            check (got && code == Command::pingReply,
+                   "stranger: a Ping IS answered even mid-session (spec 6.1 Table 9)");
+            check (lastWord0 == 0x99u, "stranger: ...echoing the sender's Ping Id");
         }
 
         sendRaw ([] (Writer& w) { writeBye (w, ByeReason::undefined); });
@@ -941,6 +956,86 @@ int main()
             check (lazyPeer.receive (in, sizeof in, f) <= 0,
                    "bye-repeat: ...and nothing more is sent afterwards");
         }
+    }
+
+    // 7j. A quiet sender declares itself idle (§7.2.1).
+    //
+    // "If a Sender has a period where there is no UMP data to send, the Sender shall
+    // send a Zero Length UMP Data Command to inform the Receiver that the Sender
+    // currently has no further UMP data" -- the first within 300ms of the last
+    // non-zero-length command, then at growing intervals, eventually stopping.
+    //
+    // Without it, a sender with nothing to play looks exactly like one that has died
+    // or lost its route, and the receiver can only wait out its own idle timeout.
+    {
+        PosixUdp idleSock, watcher;
+        std::uint16_t isPort = 0, wPort = 0;
+        check (idleSock.bind (0, isPort) && watcher.bind (0, wPort), "idle: sockets bound");
+
+        Platform isPlat { &idleSock, &clock, nullptr };
+        Recorder isRec ("idlesender");
+        Session sender (isPlat, Role::host, &isRec, "Idle Sender", "IDLE-SENDER-1");
+        Session::Timing t;
+        t.pingIntervalMs   = 100000;   // keep pings out of the way
+        t.idleDeclareMs    = 60;
+        t.idleDeclareCount = 4;        // 60, 120, 240, 480 then silence
+        sender.setTiming (t);
+        sender.listen();
+
+        Endpoint isEp {}; std::strcpy (isEp.address, "127.0.0.1"); isEp.port = isPort;
+        {
+            std::uint8_t b[16]; Writer w (b, sizeof b);
+            w.writeSignature(); w.writeHeader (Command::invitation, 0, 0);
+            watcher.send (isEp, b, w.size());
+        }
+        for (int i = 0; i < 200 && sender.state() != State::established; ++i)
+        { sender.tick(); usleep (500); }
+        check (sender.state()==State::established, "idle: established");
+
+        int zeroLen = 0, withData = 0;
+        std::uint16_t seqs[16] = {}; int seqCount = 0;
+        auto drainWatcher = [&] {
+            std::uint8_t in[512]; Endpoint from; int n = 0;
+            while ((n = watcher.receive (in, sizeof in, from)) > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code != Command::umpData) return;
+                    if (c.payloadWords == 0) ++zeroLen; else ++withData;
+                    if (seqCount < 16) seqs[seqCount++] = c.cmdSpecific;
+                });
+        };
+
+        // Nothing has been sent yet, so there is nothing to be idle FROM. A peer
+        // that has never sent UMP must stay quiet rather than chatter.
+        for (int i = 0; i < 400; ++i) { sender.tick(); drainWatcher(); usleep (500); }
+        check (zeroLen == 0, "idle: a sender that never sent UMP stays silent");
+
+        // Send one real message; the idle declarations should follow it.
+        std::uint32_t note[2] = { 0x40903C00u, 0xFFFF0000u };
+        check (sender.sendUmp (note, 2), "idle: a real UMP is sent");
+        for (int i = 0; i < 300; ++i) { sender.tick(); drainWatcher(); usleep (500); }
+        check (withData == 1, "idle: ...and arrives exactly once");
+        check (zeroLen >= 1, "idle: a zero-length declaration follows the quiet period");
+
+        // Let the backoff run out. It must stop, not trickle forever.
+        for (int i = 0; i < 3000; ++i) { sender.tick(); drainWatcher(); usleep (500); }
+        check (zeroLen == 4, "idle: exactly idleDeclareCount declarations, then silence");
+
+        const int settled = zeroLen;
+        for (int i = 0; i < 1500; ++i) { sender.tick(); drainWatcher(); usleep (500); }
+        check (zeroLen == settled, "idle: ...and it really has stopped");
+
+        // §7.2.1: "Zero Length Data Commands shall use Sequence Numbers in the same
+        // manner as any other UMP Data Command." Consecutive and increasing, so the
+        // receiver's gap detection still works across the quiet patch.
+        bool seqOk = (seqCount >= 5);
+        for (int i = 1; i < seqCount && seqOk; ++i)
+            seqOk = (std::uint16_t (seqs[i-1] + 1) == seqs[i]);
+        check (seqOk, "idle: declarations carry consecutive Sequence Numbers (spec 7.2.1)");
+
+        // Sending real data again must restart the whole cycle.
+        check (sender.sendUmp (note, 2), "idle: a second real UMP is sent");
+        for (int i = 0; i < 400; ++i) { sender.tick(); drainWatcher(); usleep (500); }
+        check (zeroLen > settled, "idle: fresh data re-arms the idle declarations");
     }
 
     // 8. Graceful close.
