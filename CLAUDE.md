@@ -54,7 +54,7 @@ Nothing here should depend on those projects. This is a standalone library.
 Protocol.h   pure wire format: 4-byte "MIDI" signature, 32-bit command header,
              command-code enum, big-endian build/parse (Writer + parseDatagram).
 Session.h    the state machine on top: Role (host/client),
-             State (idle→inviting→established→closed), connect/listen/close/
+             State (idle→inviting→established→closing→closed), connect/listen/close/
              sendUmp/tick, ping keepalive, timeout, Bye, sequence-number dedup.
              Delivers received UMP + state changes via ISessionListener.
 Platform.h   injected I/O: IUdpSocket (non-blocking send/recv), IClock (millis),
@@ -123,8 +123,9 @@ Three suites:
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
   NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, the §7.1 /
   §5.5 replies owed to a sender we have no session with, FEC repeats deduplicated
-  across a 64‑entry window (including the `0xFFFF` wrap), liveness timeout, graceful
-  Bye → Closed.
+  across a 64‑entry window (including the `0xFFFF` wrap), an unanswered Invitation
+  expiring into Bye `0x04`, a Bye retransmitted until acknowledged, liveness timeout,
+  graceful Bye → Closed.
 
 **Replying vs accepting.** Several things are answered regardless of who sent them —
 an Invitation, a sessionless Ping, a Bye (always acknowledged, §6.16), an Invitation
@@ -145,6 +146,14 @@ to ignore one that arrives when already Established. Since hosts retransmit the
 Accepted until they see traffic, checking those in the wrong order makes a client
 destroy its own session with the host's own recovery packet. When adding another of
 these, ask what happens when it fires against a legitimate retransmission.
+
+**Closing takes time now.** `close()` enters `closing` (the spec's Pending Bye, §6.1)
+and repeats the Bye until the peer replies or `byeTimeoutMs` expires — it does NOT
+return with the session already closed. Anything waiting for a teardown must watch
+for `State::closed`, not assume `close()` finished the job. Same for an unanswered
+Invitation: it expires into a Bye and Pending Bye rather than retrying forever
+(§6.2). `State` gained `closing` between `established` and `closed`, so a consumer
+switching exhaustively over it will need a new arm.
 
 **Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
 hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught

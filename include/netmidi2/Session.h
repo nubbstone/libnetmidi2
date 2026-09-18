@@ -21,7 +21,18 @@
 namespace netmidi2
 {
 
-enum class State { idle, inviting, established, closed };
+/*  Session states, in lifecycle order.
+
+    `inviting` is the spec's "Pending Invitation" and `closing` its "Pending Bye"
+    (§6.1): we have sent a Bye and are repeating it until the peer answers with a
+    Bye Reply or we give up. `closed` is ours rather than the spec's -- §6.3.1 has
+    both ends return to Idle after a teardown, but a library is more useful if a
+    finished Session stays finished and says so, instead of silently looking ready
+    to accept the next stranger that comes along.
+
+    The auth and session-reset states (§6.1) are Phase 2/3 and absent.
+*/
+enum class State { idle, inviting, established, closing, closed };
 enum class Role  { host, client };
 
 class ISessionListener
@@ -36,11 +47,23 @@ class Session
 {
 public:
     // Timing (ms). Conservative defaults; tune per transport.
+    /*  §6.2 recommends 300ms-2s between repeats of a repeated Command, and requires
+        that a Device which reaches its timeout without a suitable reply stops
+        repeating and sends a Bye.
+
+        New fields go on the END of this struct: consumers may be initialising the
+        original three positionally, and inserting a field in the middle would
+        silently change what their numbers mean.
+    */
     struct Timing
     {
         std::uint32_t inviteRetryMs = 500;
         std::uint32_t pingIntervalMs = 2000;
         std::uint32_t timeoutMs = 10000;
+
+        std::uint32_t inviteTimeoutMs = 10000; // stop inviting, send Bye (§6.2)
+        std::uint32_t byeRetryMs = 500;        // repeat an unanswered Bye (§6.16)
+        std::uint32_t byeTimeoutMs = 3000;     // give up waiting for the Bye Reply
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -60,6 +83,7 @@ public:
         touch();
         if (role == Role::client)
         {
+            inviteStartMs = plat.clock->nowMs();   // when to stop trying (§6.2)
             sendInvitation();
             setState (State::inviting);
         }
@@ -68,12 +92,32 @@ public:
     // Host: wait for an inbound Invitation (peer learned on receipt).
     void listen() noexcept { setState (State::idle); }
 
-    // Graceful close.
+    /*  Graceful close. Enters `closing` (the spec's Pending Bye) and repeats the Bye
+        until the peer answers or byeTimeoutMs elapses -- §6.16: "The Bye Command
+        should be sent repeatedly until a Bye Reply Command is received, or until a
+        timeout occurs."
+
+        The session is NOT closed the moment this returns. It used to be: one Bye
+        went out and the state went straight to `closed`, so a single lost datagram
+        left the peer holding a session we had already forgotten, waiting out its own
+        idle timeout with no idea we had gone. That is the teardown-path twin of the
+        lost-Accepted bug on the setup path.
+    */
     void close (ByeReason reason = ByeReason::undefined) noexcept
     {
+        if (st == State::closing || st == State::closed)
+            return;                                  // already tearing down
+
         if (st == State::established || st == State::inviting)
-            sendBye (reason);
-        setState (State::closed);
+        {
+            byeReason  = reason;
+            byeStartMs = plat.clock->nowMs();
+            sendByeNow();
+            setState (State::closing);
+            return;
+        }
+
+        setState (State::closed);                    // idle: nothing to tear down
     }
 
     // Send UMP words (host order) — only valid when Established.
@@ -104,8 +148,23 @@ public:
 
         const std::uint32_t now = plat.clock->nowMs();
 
-        if (st == State::inviting && now - lastInviteMs >= timing.inviteRetryMs)
-            sendInvitation();
+        if (st == State::inviting)
+        {
+            /* §6.2: a repeated Command is not repeated forever. "If a Device reaches
+             * its preferred timeout without receiving a suitable reply, then the
+             * Device shall cease repeating the Command and send a Bye Command."
+             *
+             * Checked before the retry, so the last act of an expiring invitation is
+             * the Bye, not another Invitation. Without this a client that invited a
+             * host which never answered sat in `inviting` forever -- no timeout, no
+             * error, no Bye. That is the "client retries forever, nothing times out"
+             * half of the handshake deadlock: the host's side was fixed in 141a075,
+             * but the client's inability to ever give up was left in place. */
+            if (now - inviteStartMs >= timing.inviteTimeoutMs)
+                close (ByeReason::timeout);
+            else if (now - lastInviteMs >= timing.inviteRetryMs)
+                sendInvitation();
+        }
 
         if (st == State::established)
         {
@@ -113,6 +172,17 @@ public:
                 sendPing();
             if (now - lastRxMs >= timing.timeoutMs)
                 close (ByeReason::timeout);
+        }
+
+        if (st == State::closing)
+        {
+            /* Timeout first, so giving up never emits one last Bye on its way out --
+             * §6.2 excepts a repeated Bye from the "send a Bye on timeout" rule, for
+             * the obvious reason. */
+            if (now - byeStartMs >= timing.byeTimeoutMs)
+                setState (State::closed);
+            else if (now - lastByeMs >= timing.byeRetryMs)
+                sendByeNow();
         }
     }
 
@@ -131,9 +201,13 @@ private:
 
     //== admission ============================================================
     // Is this datagram from the endpoint we are actually in a session with?
+    // `closing` counts: we are waiting on that peer's Bye Reply, and if this did not
+    // include it the very reply the teardown is blocking on would be refused at the
+    // door and every close would have to wait out its full timeout.
     bool isFromPeer (const Endpoint& from) const noexcept
     {
-        return (st == State::inviting || st == State::established) && from == peer;
+        return (st == State::inviting || st == State::established || st == State::closing)
+               && from == peer;
     }
 
     // No session is at stake in these states, so there is nothing to protect.
@@ -269,7 +343,7 @@ private:
             case Command::pingReply:               break; // liveness already refreshed
             case Command::umpData:                 onUmpData (c);          break;
             case Command::bye:                     onBye (from, fromPeer); break;
-            case Command::byeReply:                setState (State::closed); break;
+            case Command::byeReply:                onByeReply();           break;
             case Command::nak:                     onNak();                break;
             default:                               break; // ignore for Phase 1
         }
@@ -444,6 +518,21 @@ private:
             deliverUmp (c.payload, c.payloadWords);
     }
 
+    void onByeReply() noexcept
+    {
+        /* §6.17: "If a Device receives a Bye Reply Command, the Device shall stop
+         * repeatedly sending the Bye Command. If there is no Established Session
+         * with the sender of the Bye Reply Command, the receiver shall ignore the
+         * Bye Reply Command."
+         *
+         * `closing` is the only state in which we are waiting for one, so it is the
+         * only state in which one means anything. Previously any Bye Reply from our
+         * peer closed us -- including one arriving while we were still `inviting`,
+         * where there is no session to end and the spec says to ignore it. */
+        if (st == State::closing)
+            setState (State::closed);
+    }
+
     void onBye (const Endpoint& from, bool fromPeer) noexcept
     {
         /* Acknowledge every Bye, to the sender. §6.16: "Because the Bye Command
@@ -533,6 +622,14 @@ private:
     }
     void sendPingReply (std::uint32_t id) noexcept { sendOne ([&] (Writer& w) { return writePingReply (w, id); }); }
     void sendBye (ByeReason r) noexcept            { sendOne ([&] (Writer& w) { return writeBye (w, r); }); }
+
+    // One repeat of the Bye we are currently trying to deliver, stamping the retry
+    // clock. The reason is resent verbatim so every copy is identical.
+    void sendByeNow() noexcept
+    {
+        lastByeMs = plat.clock->nowMs();
+        sendBye (byeReason);
+    }
     // (No sendByeReply() to `peer`: a Bye Reply always goes to whoever sent the Bye,
     //  which is not necessarily our peer — see onBye.)
 
@@ -571,6 +668,10 @@ private:
     std::uint64_t     rxWindow = 0;    // bit i => (lastRx - i) already processed
 
     std::uint32_t     lastRxMs = 0, lastPingMs = 0, lastInviteMs = 0, pingId = 0;
+
+    std::uint32_t     inviteStartMs = 0;                  // when this invitation began
+    std::uint32_t     byeStartMs = 0, lastByeMs = 0;      // Pending Bye timers
+    ByeReason         byeReason = ByeReason::undefined;   // repeated verbatim
 };
 
 } // namespace netmidi2

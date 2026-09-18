@@ -85,7 +85,8 @@ struct Recorder : ISessionListener
     void onStateChanged (State s) override
     {
         state = s;
-        const char* n = s==State::idle?"idle":s==State::inviting?"inviting":s==State::established?"established":"closed";
+        const char* n = s==State::idle?"idle":s==State::inviting?"inviting"
+                      : s==State::established?"established":s==State::closing?"closing":"closed";
         printf ("  [%s] state -> %s\n", who, n);
     }
 };
@@ -401,6 +402,7 @@ int main()
         Session c4s (c4Plat, Role::client, &c4Rec, "Timeout Client", "TO-CLIENT-1");
 
         Session::Timing fast; fast.timeoutMs = 400; fast.pingIntervalMs = 100000;
+        fast.byeTimeoutMs = 300;   // the vanished peer will never answer the Bye
         h4s.setTiming (fast);
 
         h4s.listen();
@@ -422,8 +424,18 @@ int main()
             }
             h4s.tick(); usleep (1000);
         }
-        check (h4s.state()==State::closed,
+        // Timing out goes through Pending Bye now, not straight to Closed: the host
+        // announces its departure with Bye 0x04 and waits for the acknowledgement.
+        check (h4s.state()==State::closing,
                "liveness: host still times out despite a stranger's pings");
+
+        // The peer is gone and will never answer, so the Bye must not be repeated
+        // forever either -- §6.2 excepts a repeated Bye from "send a Bye on
+        // timeout", so this expires quietly into Closed.
+        for (int i = 0; i < 800 && h4s.state() != State::closed; ++i)
+        { h4s.tick(); usleep (1000); }
+        check (h4s.state()==State::closed,
+               "liveness: an unanswered Bye eventually gives up rather than repeating forever");
     }
 
     // 7c. An over-long UMP Data command must not be believed.
@@ -778,6 +790,150 @@ int main()
         // the wrap boundary must be seen as repeats, not as a 65535-packet jump.
         check (whRec.umpCount - mark == 4,
                "wrap: 0xFFFE->0x0001 delivers 4 distinct, repeats still deduplicated");
+    }
+
+    // 7h. An invitation that is never answered must give up (§6.2).
+    //
+    // "If a Device reaches its preferred timeout without receiving a suitable reply,
+    // then the Device shall cease repeating the Command and send a Bye Command."
+    //
+    // A client used to retry the Invitation forever: no timeout, no error, no Bye,
+    // no way for the application to learn that nobody was listening. This is the
+    // client-side half of the handshake deadlock -- 141a075 fixed the host's refusal
+    // to re-answer, but the client's inability to ever stop was left in place, and
+    // that half needs no broken peer at all. Here the "host" is a bare socket that
+    // never replies.
+    {
+        PosixUdp lonelyClientSock, deafHost;
+        std::uint16_t lcPort = 0, dhPort = 0;
+        check (lonelyClientSock.bind (0, lcPort) && deafHost.bind (0, dhPort),
+               "invite-timeout: sockets bound");
+
+        Platform lcPlat { &lonelyClientSock, &clock, nullptr };
+        Recorder lcRec ("lonely");
+        Session lonely (lcPlat, Role::client, &lcRec, "Lonely Client", "LONELY-1");
+
+        Session::Timing t;
+        t.inviteRetryMs   = 50;
+        t.inviteTimeoutMs = 400;
+        t.byeTimeoutMs    = 200;      // the deaf host will not answer the Bye either
+        lonely.setTiming (t);
+
+        Endpoint dhEp {}; std::strcpy (dhEp.address, "127.0.0.1"); dhEp.port = dhPort;
+        lonely.connect (dhEp);
+        check (lonely.state()==State::inviting, "invite-timeout: client starts out inviting");
+
+        // It should keep trying for a while -- giving up instantly would be its own bug.
+        for (int i = 0; i < 150; ++i) { lonely.tick(); usleep (1000); }
+        check (lonely.state()==State::inviting, "invite-timeout: still trying at 150ms");
+
+        int invitations = 0;
+        {
+            std::uint8_t in[256]; Endpoint from;
+            while (deafHost.receive (in, sizeof in, from) > 0)
+                parseDatagram (in, sizeof in, [&] (const ParsedCommand& c) {
+                    if (c.code == Command::invitation) ++invitations;
+                });
+        }
+        check (invitations >= 2, "invite-timeout: the Invitation was actually repeated");
+
+        // ...and then stop, announcing the fact with a Bye rather than going quiet.
+        for (int i = 0; i < 500 && lonely.state() == State::inviting; ++i)
+        { lonely.tick(); usleep (1000); }
+        check (lonely.state()==State::closing, "invite-timeout: gives up and enters Pending Bye");
+
+        bool sawByeTimeout = false;
+        {
+            std::uint8_t in[256]; Endpoint from;
+            int n = 0;
+            while ((n = deafHost.receive (in, sizeof in, from)) > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::bye
+                        && c.data1() == std::uint8_t (ByeReason::timeout))
+                        sawByeTimeout = true;
+                });
+        }
+        check (sawByeTimeout, "invite-timeout: ...and says why, with Bye reason 0x04");
+
+        for (int i = 0; i < 600 && lonely.state() != State::closed; ++i)
+        { lonely.tick(); usleep (1000); }
+        check (lonely.state()==State::closed, "invite-timeout: reaches Closed, not stuck");
+    }
+
+    // 7i. A Bye is repeated until acknowledged (§6.16).
+    //
+    // "The Bye Command should be sent repeatedly until a Bye Reply Command is
+    // received, or until a timeout occurs."
+    //
+    // close() used to send exactly one Bye and declare itself Closed on the spot, so
+    // a single lost datagram left the peer holding a session we had already dropped,
+    // waiting out its own idle timeout with no idea we had gone -- the teardown
+    // twin of the lost-Accepted bug. The peer here is a raw socket that ignores the
+    // first Bye entirely and only then answers.
+    {
+        PosixUdp goodbyeSock, lazyPeer;
+        std::uint16_t gbPort = 0, lpPort = 0;
+        goodbyeSock.bind (0, gbPort); lazyPeer.bind (0, lpPort);
+
+        Platform gbPlat { &goodbyeSock, &clock, nullptr };
+        Recorder gbRec ("goodbye");
+        Session goodbye (gbPlat, Role::host, &gbRec, "Goodbye Host", "BYE-HOST-1");
+        Session::Timing t; t.byeRetryMs = 60; t.byeTimeoutMs = 5000;
+        goodbye.setTiming (t);
+        goodbye.listen();
+
+        Endpoint gbEp {}; std::strcpy (gbEp.address, "127.0.0.1"); gbEp.port = gbPort;
+        {
+            std::uint8_t b[16]; Writer w (b, sizeof b);
+            w.writeSignature(); w.writeHeader (Command::invitation, 0, 0);
+            lazyPeer.send (gbEp, b, w.size());
+        }
+        for (int i = 0; i < 100 && goodbye.state() != State::established; ++i)
+        { goodbye.tick(); usleep (1000); }
+        check (goodbye.state()==State::established, "bye-repeat: established");
+
+        { std::uint8_t in[256]; Endpoint f; while (lazyPeer.receive (in, sizeof in, f) > 0) {} }
+
+        goodbye.close (ByeReason::userRejected);
+        check (goodbye.state()==State::closing,
+               "bye-repeat: close() enters Pending Bye, not Closed");
+
+        // Ignore the Bye for a while. It must keep arriving.
+        for (int i = 0; i < 250; ++i) { goodbye.tick(); usleep (1000); }
+        check (goodbye.state()==State::closing, "bye-repeat: still waiting for the Bye Reply");
+
+        int byes = 0; Endpoint fromPeerAddr {};
+        {
+            std::uint8_t in[256]; Endpoint from; int n = 0;
+            while ((n = lazyPeer.receive (in, sizeof in, from)) > 0)
+            {
+                fromPeerAddr = from;
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::bye
+                        && c.data1() == std::uint8_t (ByeReason::userRejected))
+                        ++byes;
+                });
+            }
+        }
+        check (byes >= 2, "bye-repeat: the Bye was retransmitted, reason preserved");
+
+        // Now answer it; the repeats must stop and the session finish.
+        {
+            std::uint8_t b[16]; Writer w (b, sizeof b);
+            w.writeSignature(); writeByeReply (w);
+            lazyPeer.send (gbEp, b, w.size());
+        }
+        for (int i = 0; i < 200 && goodbye.state() != State::closed; ++i)
+        { goodbye.tick(); usleep (1000); }
+        check (goodbye.state()==State::closed, "bye-repeat: the Bye Reply completes the close");
+
+        { std::uint8_t in[256]; Endpoint f; while (lazyPeer.receive (in, sizeof in, f) > 0) {} }
+        for (int i = 0; i < 200; ++i) { goodbye.tick(); usleep (1000); }
+        {
+            std::uint8_t in[256]; Endpoint f;
+            check (lazyPeer.receive (in, sizeof in, f) <= 0,
+                   "bye-repeat: ...and nothing more is sent afterwards");
+        }
     }
 
     // 8. Graceful close.
