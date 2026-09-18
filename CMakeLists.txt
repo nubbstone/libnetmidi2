@@ -61,5 +61,10 @@ if(NOT NETMIDI2_SKIP_TESTS)
         add_executable(nm2_auth tests/auth.cpp)
         target_link_libraries(nm2_auth PRIVATE netmidi2)
         add_test(NAME nm2_auth COMMAND nm2_auth)
+
+        # Session Reset (spec 6.11 / 6.12) — the exchange, and clearing BOTH counters.
+        add_executable(nm2_session_reset tests/session_reset.cpp)
+        target_link_libraries(nm2_session_reset PRIVATE netmidi2)
+        add_test(NAME nm2_session_reset COMMAND nm2_session_reset)
     endif()
 endif()
