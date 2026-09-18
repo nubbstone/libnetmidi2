@@ -813,50 +813,55 @@ int main()
         Recorder lcRec ("lonely");
         Session lonely (lcPlat, Role::client, &lcRec, "Lonely Client", "LONELY-1");
 
+        // Timing chosen for margin, not speed: the "still trying" checkpoint sits
+        // far below inviteTimeoutMs so a slow CI runner overshooting its sleeps
+        // cannot turn a correct library into a red build. Everything below is
+        // driven off the clock rather than an iteration count, for the same reason.
         Session::Timing t;
         t.inviteRetryMs   = 50;
-        t.inviteTimeoutMs = 400;
-        t.byeTimeoutMs    = 200;      // the deaf host will not answer the Bye either
+        t.inviteTimeoutMs = 1000;
+        t.byeTimeoutMs    = 400;      // the deaf host will not answer the Bye either
         lonely.setTiming (t);
+
+        // One drain, accumulating into counters. Reading the socket is destructive,
+        // so a drain that throws away what it does not currently care about will
+        // eat the evidence a later check needs -- which it did.
+        int  invitations   = 0;
+        bool sawByeTimeout = false;
+        auto drainDeafHost = [&] {
+            std::uint8_t in[512]; Endpoint from; int n = 0;
+            while ((n = deafHost.receive (in, sizeof in, from)) > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::invitation)
+                        ++invitations;
+                    else if (c.code == Command::bye
+                             && c.data1() == std::uint8_t (ByeReason::timeout))
+                        sawByeTimeout = true;
+                });
+        };
 
         Endpoint dhEp {}; std::strcpy (dhEp.address, "127.0.0.1"); dhEp.port = dhPort;
         lonely.connect (dhEp);
         check (lonely.state()==State::inviting, "invite-timeout: client starts out inviting");
 
-        // It should keep trying for a while -- giving up instantly would be its own bug.
-        for (int i = 0; i < 150; ++i) { lonely.tick(); usleep (1000); }
-        check (lonely.state()==State::inviting, "invite-timeout: still trying at 150ms");
-
-        int invitations = 0;
-        {
-            std::uint8_t in[256]; Endpoint from;
-            while (deafHost.receive (in, sizeof in, from) > 0)
-                parseDatagram (in, sizeof in, [&] (const ParsedCommand& c) {
-                    if (c.code == Command::invitation) ++invitations;
-                });
-        }
+        // Keep trying for a while -- giving up instantly would be its own bug.
+        const std::uint32_t t0 = clock.nowMs();
+        while (clock.nowMs() - t0 < 250) { lonely.tick(); drainDeafHost(); usleep (500); }
+        check (lonely.state()==State::inviting, "invite-timeout: still inviting well before the timeout");
         check (invitations >= 2, "invite-timeout: the Invitation was actually repeated");
 
-        // ...and then stop, announcing the fact with a Bye rather than going quiet.
-        for (int i = 0; i < 500 && lonely.state() == State::inviting; ++i)
-        { lonely.tick(); usleep (1000); }
+        // ...then stop, announcing it with a Bye rather than going quiet. Break the
+        // instant the state leaves `inviting`, so Pending Bye is observed as it
+        // happens and cannot be missed by expiring into Closed first.
+        for (int i = 0; i < 4000 && lonely.state() == State::inviting; ++i)
+        { lonely.tick(); drainDeafHost(); usleep (500); }
         check (lonely.state()==State::closing, "invite-timeout: gives up and enters Pending Bye");
 
-        bool sawByeTimeout = false;
-        {
-            std::uint8_t in[256]; Endpoint from;
-            int n = 0;
-            while ((n = deafHost.receive (in, sizeof in, from)) > 0)
-                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
-                    if (c.code == Command::bye
-                        && c.data1() == std::uint8_t (ByeReason::timeout))
-                        sawByeTimeout = true;
-                });
-        }
+        for (int i = 0; i < 20; ++i) { lonely.tick(); drainDeafHost(); usleep (500); }
         check (sawByeTimeout, "invite-timeout: ...and says why, with Bye reason 0x04");
 
-        for (int i = 0; i < 600 && lonely.state() != State::closed; ++i)
-        { lonely.tick(); usleep (1000); }
+        for (int i = 0; i < 4000 && lonely.state() != State::closed; ++i)
+        { lonely.tick(); drainDeafHost(); usleep (500); }
         check (lonely.state()==State::closed, "invite-timeout: reaches Closed, not stuck");
     }
 
@@ -878,7 +883,9 @@ int main()
         Platform gbPlat { &goodbyeSock, &clock, nullptr };
         Recorder gbRec ("goodbye");
         Session goodbye (gbPlat, Role::host, &gbRec, "Goodbye Host", "BYE-HOST-1");
-        Session::Timing t; t.byeRetryMs = 60; t.byeTimeoutMs = 5000;
+        // byeTimeoutMs is deliberately huge: this test answers the Bye itself, so
+        // the timeout must never be what ends the wait, however slow the machine.
+        Session::Timing t; t.byeRetryMs = 60; t.byeTimeoutMs = 60000;
         goodbye.setTiming (t);
         goodbye.listen();
 
