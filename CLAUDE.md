@@ -63,6 +63,8 @@ HostPort.h   one UDP port, many Clients (§3.2): owns the shared socket and rout
              each datagram to a Session by source endpoint. Host-side only.
 Discovery.h  the mDNS/DNS-SD contract (§4): IDiscovery, DiscoveredHost, the TXT
              field limits and TTL ceiling. No responder here — that's an adapter.
+Auth.h       the §6.7–6.10 contract: ICrypto (sha256 + randomBytes), the digest
+             construction, constant-time compare. No crypto implemented here.
 ```
 
 **One Session is one conversation, not one Host.** §3.2 requires a Host to serve all
@@ -82,7 +84,8 @@ runnable example with POSIX adapters.
 ## Repository layout
 
 ```
-include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h · Discovery.h
+include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h
+                   Discovery.h · Auth.h
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
 tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
                    protocol_guards.cpp     — malformed/oversized input rejection (unit)
@@ -91,7 +94,8 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
                    discovery.cpp           — mDNS contract + limits, fake adapter (§4)
                    fec_sending.cpp         — FEC repeat order, size cap, idle (§7.2.2)
                    retransmit.cpp          — request/serve/NAK handling (§7.2.3–7.2.4)
-CMakeLists.txt     INTERFACE target `netmidi2` + all seven tests (add_test)
+                   auth.cpp                — digests vs the spec's examples (§6.7–6.10)
+CMakeLists.txt     INTERFACE target `netmidi2` + all eight tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT, © Nubbstone
@@ -122,10 +126,10 @@ LICENSE            MIT, © Nubbstone
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # all seven suites
+ctest --test-dir build --output-on-failure     # all eight suites
 ```
 
-Seven suites:
+Eight suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
@@ -150,6 +154,10 @@ Seven suites:
   history, Retransmit Error when it has aged out, Bye `0x05` with no session, gap
   detection and bounded re‑asking, and that a NAK of our request stops the asking
   without tearing the session down.
+- **`nm2_auth`** (integration, POSIX + a reference SHA‑256). Both published digest
+  vectors byte‑for‑byte, nonce generation, the full challenge/response both ways,
+  wrong secret and unknown user rejected, Bye `0x45` for a client that cannot
+  authenticate, and a host with no `ICrypto` declining to pretend.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
@@ -203,6 +211,18 @@ Receiving FEC repeats has no switch and never did — §7.2.2 makes coping with 
 receiver `shall`, since the peer may send them whatever we do. When touching FEC, the
 rule that looks like style and is not: repeats go **oldest‑first, new command last**.
 
+**No crypto in this library.** SHA‑256 and entropy come through `ICrypto`, so a
+platform uses CommonCrypto, mbedTLS, or a hardware SHA engine. Do not add a built‑in
+hash — it would ship one implementation everywhere and make accelerators unreachable.
+The security here rests on the **nonce**, not the hash: the spec's own example secret
+is `5483`, so the digest is only as strong as a PIN, and `randomBytes` returning
+false must mean no challenge is issued rather than a guessable one. §6.7's doubling
+failure delay *is* the defence, and digest comparison must stay constant‑time.
+
+**The `0x12`/`0x13` framing is inferred, not transcribed.** Those tables contradict
+themselves; PROTOCOL.md §3.7 argues the reading from their own `pl` ranges. If a real
+peer disagrees about those two commands, start there — the digests are solid.
+
 **A NAK is not automatically a session problem.** `onNak` reads the echoed command
 header (§6.15) before reacting. A NAK of our Retransmit Request means only that the
 peer does not implement Retransmit; the generic "re‑invite" response would tear down
@@ -246,7 +266,7 @@ explicit `host:port`.
 | ~~mDNS discovery contract + orchestration~~ | **done** (`Discovery.h`; the responder itself is adapter work) |
 | ~~FEC sending~~ (receiving always worked) | **done** (`Session::setFecSlots`) |
 | ~~Retransmit (`0x80`/`0x81`)~~ | **done** (shares the sent‑UMP history with FEC) |
-| Authentication (Invitation with Auth `0x02`/`0x03`, nonce/sha256) | planned |
+| ~~Authentication (`0x02`/`0x03`, `0x12`/`0x13`)~~ | **done** (`Auth.h`; SHA‑256 + entropy injected via `ICrypto`) |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
 ## Reference material

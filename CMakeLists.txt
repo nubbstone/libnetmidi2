@@ -56,5 +56,10 @@ if(NOT NETMIDI2_SKIP_TESTS)
         add_executable(nm2_retransmit tests/retransmit.cpp)
         target_link_libraries(nm2_retransmit PRIVATE netmidi2)
         add_test(NAME nm2_retransmit COMMAND nm2_retransmit)
+
+        # Authentication (spec 6.7-6.10) — digests vs the spec's worked examples.
+        add_executable(nm2_auth tests/auth.cpp)
+        target_link_libraries(nm2_auth PRIVATE netmidi2)
+        add_test(NAME nm2_auth COMMAND nm2_auth)
     endif()
 endif()
