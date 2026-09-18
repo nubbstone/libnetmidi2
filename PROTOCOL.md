@@ -503,6 +503,38 @@ returned, not the one requested); `Session::connect(const DiscoveredHost&)` dial
 
 ---
 
+## 4.5 One device, several roles or endpoints (§8–§9)
+
+No wire format here — these are constraints on how a device is *arranged*, and they
+are easy to violate without anything on the network complaining.
+
+**Acting as Host and Client at once (§8).** A device that does both "and which
+represent the same UMP Endpoint **shall** use the same Endpoint Name and Product
+Instance Id in both roles" — in its TXT record, its Invitation, and every Invitation
+Reply. The point is recognition: without it, the peer you invite and the peer that
+invites you look like two different devices, and neither end can tell it is already
+connected to you. "The Client and the Host should each use their own UDP Port."
+
+**Several UMP Endpoints on one device (§9).** Each exposed endpoint "**shall** be
+represented by an own Host instance with an own UDP port, and an own UMP Endpoint
+Name". The Product Instance Id and the IP addresses are shared — the Product Instance
+Id identifies the *device*, the UMP Endpoint Name identifies the *endpoint*. §4.4 says
+the same from the other direction: "A Device with multiple Host instances shall use a
+different UMP Endpoint Name for each Host instance", and "should use the same Product
+Instance Id for all Hosts".
+
+Note how this differs from serving several Clients, which is the opposite arrangement:
+many Clients share **one** Host port (§3.2, see §4.3), while many Endpoints each need
+**their own**. In this library that means one `HostPort` per UMP Endpoint, each with
+its own socket and its own name, and N `Session` slots inside each one for the Clients
+it serves.
+
+*(§8's cross-references are off by one throughout — it cites "Invitation Command
+(Section 6.3)" where Invitation is §6.4, and so on down the list. Follow the command
+names, not the numbers.)*
+
+---
+
 ## 5. Data-integrity (§7.2) — phased
 
 - **Dedup:** ignore a UMP Data command whose Sequence Number was already processed.

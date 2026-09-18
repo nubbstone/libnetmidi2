@@ -217,6 +217,14 @@ Receiving FEC repeats has no switch and never did — §7.2.2 makes coping with 
 receiver `shall`, since the peer may send them whatever we do. When touching FEC, the
 rule that looks like style and is not: repeats go **oldest‑first, new command last**.
 
+**Many Clients share one port; many Endpoints do not.** §3.2 has a Host serve all its
+Clients from a single UDP port (that is what `HostPort` is for), while §9 requires each
+UMP Endpoint a device exposes to have **its own** Host instance, port and Endpoint
+Name — so one `HostPort` per Endpoint, N Session slots inside each. A device acting as
+both Host and Client for the same Endpoint (§8) uses the same Endpoint Name and
+Product Instance Id in both roles, on separate ports, or peers cannot tell the two
+halves are one device. PROTOCOL.md §4.5.
+
 **Resetting means BOTH counters.** §6.11 resets sequence numbers to zero on each
 end. Clearing only `txSeq` fails silently: the peer restarts at `0`, our replay
 window still holds the old numbers, and everything after the reset is dropped as a
