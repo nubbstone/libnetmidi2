@@ -88,6 +88,7 @@ runnable example with POSIX adapters.
 include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h
                    Discovery.h · Auth.h
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
+UPGRADING.md       what consumers must change, and what is not yet proven
 tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
                    protocol_guards.cpp     — malformed/oversized input rejection (unit)
                    session_loopback.cpp    — Host+Client over real localhost UDP
@@ -307,6 +308,10 @@ explicit `host:port`.
 
 ## Housekeeping / gotchas
 
+- **Consumers integrate by local path, not by tag.** When you change public API,
+  update `UPGRADING.md` — it is what the M2 SoundGen App and midi2-router-service read
+  before pulling. Prefer a rename that fails to compile over a silent change of
+  meaning, and say so there.
 - **Placeholders:** `LICENSE` copyright holder and the README CI badge URL are set
   (`nubbstone`). Remote: `github.com/nubbstone/libnetmidi2`.
 - **Comment hazard:** never write a `*/` inside a block comment (e.g. a path like
