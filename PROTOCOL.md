@@ -407,9 +407,9 @@ returned, not the one requested); `Session::connect(const DiscoveredHost&)` dial
   This is a **receiver `shall`**, not an optimisation (§7.2, and §7.2.2: "Every
   Device receiving a UDP packet with UMP data shall be able to skip previously
   received UMP Data Commands").
-- **FEC — receiving is Phase 1, sending is Phase 2.** Senders "should" repeat their
-  previous UMP Data commands inside later datagrams (§7.2.2); *every* receiver must
-  cope with that today, because the peer may already do it.
+- **FEC, both directions.** Senders "should" repeat their previous UMP Data commands
+  inside later datagrams (§7.2.2), and *every* receiver must cope with that whether
+  or not it sends them itself. See §5.3 below.
 - **Retransmit (Phase 2):** `0x80` Retransmit Request / `0x81` Retransmit Error
   (§7.2.3–7.2.4).
 
@@ -454,6 +454,39 @@ stop. Two deliberate limits:
 - **`idleDeclareCount = 0` disables it entirely.** §7.2.1 asks a Sender to consider
   that "the Receiver may have restrictions such as battery operation or limited
   processing in which it would prefer to not consistently receive data".
+
+### 5.3 Sending FEC (§7.2.2)
+
+"Every Client and Host should implement FEC when sending UMP packets by including
+two previously sent UMP Data Commands" — two being the recommendation, since
+"research has shown that using FEC with more than two repeats does not significantly
+improve data integrity". One repeat, or more than two, is allowed.
+
+**Order is normative, not cosmetic.** "Previous UMP payloads shall be prepended in
+the order in which they were sent. This is to allow the receiving Device to read each
+UMP Data Command in order in which it is received and just skip over the UMP Data
+Commands it has already processed." So a datagram runs `[N-2, N-1, N]`, oldest first,
+with the **new command last**. Emit them newest-first and a conforming receiver
+walking forward sees sequence numbers going backwards.
+
+**The 1400-byte limit outranks the repeats.** Two maximum-size commands plus a new one
+is 784 bytes and fits easily, but a sender configured with more repeats can exceed a
+datagram. When that happens the **oldest** repeats are dropped — a command repeated
+twice has had its chances, the newest has had fewest — and the new command is never
+what gets sacrificed. Getting this wrong does not produce oversized datagrams (the
+writer refuses those); it produces a sender that silently stops transmitting once its
+history fills, which is the opposite of what FEC is for.
+
+**Entering an idle period**, a FEC sender "should send multiple UDP packets with the
+last UMP Data Commands prior to the idle period with Zero Length UMP Data
+Command(s)... up to the number of FEC data repeats the Sender is currently using". So
+the first *N* zero-length declarations (§7.2.1) carry the repeats — giving the last
+real commands extra chances exactly when no new traffic will — and the later, sparser
+ones go out bare.
+
+In this library FEC sending is **opt-in**, via `Session::setFecSlots()` with
+caller-owned storage: a slot holds a maximum-size command, and a Session that does not
+want the memory pays none of it. Receiving has no switch and never did.
 
 **Out-of-order commands are delivered, not held back.** An unseen Sequence Number is
 passed on whatever its position, because that is exactly how FEC repairs a gap: the

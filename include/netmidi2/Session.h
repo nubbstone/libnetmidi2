@@ -35,6 +35,22 @@ namespace netmidi2
 enum class State { idle, inviting, established, closing, closed };
 enum class Role  { host, client };
 
+/*  Storage for one previously-sent UMP Data command, retained so it can be repeated
+    inside a later datagram (§7.2.2 Forward Error Correction).
+
+    Caller-owned, like every other buffer here (prime directive 1). FEC costs real
+    memory -- a slot is sized for the largest legal command, 64 words -- and a Session
+    that does not opt in pays none of it. Two slots is what §7.2.2 recommends:
+    "research has shown that using FEC with more than two repeats does not
+    significantly improve data integrity".
+*/
+struct FecSlot
+{
+    std::uint16_t seq = 0;
+    std::uint8_t  wordCount = 0;
+    std::uint32_t words[kMaxUmpWordsPerCommand] = {};
+};
+
 class ISessionListener
 {
 public:
@@ -85,6 +101,22 @@ public:
           name (endpointName), productId (productInstanceId) {}
 
     void setTiming (Timing t) noexcept { timing = t; }
+
+    /*  Turn on FEC sending (§7.2.2) by lending the Session somewhere to keep recently
+        sent UMP Data commands. `count` is the number of repeats: 2 is the spec's
+        recommendation, 1 is allowed, 0 (the default, no slots) disables FEC.
+
+        Off by default because it is the caller's memory, not ours, and the embedded
+        target is the one that cares. Receiving FEC has always worked and needs no
+        opt-in -- a peer may already be sending it (§7.2.2 makes coping with repeats
+        a receiver `shall`), which is a separate thing from whether we send it.
+    */
+    void setFecSlots (FecSlot* slots, std::uint8_t count) noexcept
+    {
+        fecSlots    = slots;
+        fecCapacity = (slots != nullptr) ? count : std::uint8_t (0);
+        fecUsed     = 0;
+    }
 
     State state() const noexcept { return st; }
     const Endpoint& remote() const noexcept { return peer; }
@@ -156,10 +188,20 @@ public:
     {
         if (st != State::established)
             return false;
+        if (count > kMaxUmpWordsPerCommand)
+            return false;                       // §7.1 Table 29
+
         std::uint8_t buf[kMaxDatagram];
         Writer w (buf, sizeof buf);
-        if (! (w.writeSignature() && writeUmpData (w, txSeq, words, count) && w.ok()))
+        if (! w.writeSignature())
             return false;
+
+        prependFecRepeats (w, kHeaderBytes + std::size_t (count) * 4);
+
+        if (! (writeUmpData (w, txSeq, words, count) && w.ok()))
+            return false;
+
+        retainForFec (txSeq, words, count);
         ++txSeq;
 
         // Real data restarts the idle clock and the backoff (§7.2.1): the first
@@ -663,6 +705,66 @@ private:
         }
     }
 
+    /*  Write the retained commands into `w`, oldest first.
+
+        §7.2.2 "FEC Packet Order" makes the order normative, not stylistic:
+        "Previous UMP payloads shall be prepended in the order in which they were
+        sent. This is to allow the receiving Device to read each UMP Data Command in
+        order in which it is received and just skip over the UMP Data Commands it has
+        already processed." Emit them newest-first and a conforming receiver walking
+        forward sees sequence numbers going backwards.
+
+        `reserveBytes` is what the new command still needs. If everything will not fit
+        inside one datagram, the OLDEST repeats are dropped: a command already
+        repeated twice has had its chances, while the most recent one has had fewest,
+        and the new command is never the thing sacrificed.
+    */
+    void prependFecRepeats (Writer& w, std::size_t reserveBytes) noexcept
+    {
+        if (fecUsed == 0)
+            return;
+
+        std::uint8_t first = fecUsed;
+        std::size_t  used  = 0;
+        for (std::uint8_t i = fecUsed; i-- > 0; )
+        {
+            const std::size_t sz = kHeaderBytes + std::size_t (fecSlots[i].wordCount) * 4;
+            if (w.size() + used + sz + reserveBytes > kMaxDatagram)
+                break;
+            used  += sz;
+            first  = i;
+        }
+
+        for (std::uint8_t i = first; i < fecUsed; ++i)
+            writeUmpData (w, fecSlots[i].seq, fecSlots[i].words, fecSlots[i].wordCount);
+    }
+
+    /*  Keep this command for repeating in later datagrams. A FIFO: oldest drops out.
+
+        Zero-length commands are NOT retained. They carry no data to recover, and
+        §7.2.1 already has them repeating on their own schedule -- retaining them
+        would push the real commands out of the history to protect packets whose
+        entire content is "nothing to say".
+    */
+    void retainForFec (std::uint16_t seq, const std::uint32_t* words, std::uint8_t count) noexcept
+    {
+        if (fecCapacity == 0 || count == 0)
+            return;
+
+        if (fecUsed == fecCapacity)
+        {
+            for (std::uint8_t i = 1; i < fecUsed; ++i)
+                fecSlots[i - 1] = fecSlots[i];
+            --fecUsed;
+        }
+
+        FecSlot& slot = fecSlots[fecUsed++];
+        slot.seq       = seq;
+        slot.wordCount = count;
+        for (std::uint8_t i = 0; i < count; ++i)
+            slot.words[i] = words[i];
+    }
+
     /*  §7.2.1: "If a Sender has a period where there is no UMP data to send, the
         Sender shall send a Zero Length UMP Data Command to inform the Receiver that
         the Sender currently has no further UMP data." The first one is due within
@@ -694,7 +796,19 @@ private:
 
         std::uint8_t buf[kMaxDatagram];
         Writer w (buf, sizeof buf);
-        if (! (w.writeSignature() && writeUmpData (w, txSeq, nullptr, 0) && w.ok()))
+        if (! w.writeSignature())
+            return;
+
+        /* §7.2.2: on entering an idle period a FEC sender "should send multiple UDP
+         * packets with the last UMP Data Commands prior to the idle period with Zero
+         * Length UMP Data Command(s)... up to the number of FEC data repeats the
+         * Sender is currently using". So the first few declarations carry the
+         * repeats -- giving the last real commands extra chances precisely when no
+         * new traffic will -- and the later, sparser ones go out bare. */
+        if (idleSent < fecCapacity)
+            prependFecRepeats (w, kHeaderBytes);
+
+        if (! (writeUmpData (w, txSeq, nullptr, 0) && w.ok()))
             return;
 
         ++txSeq;
@@ -802,6 +916,10 @@ private:
     std::uint64_t     rxWindow = 0;    // bit i => (lastRx - i) already processed
 
     std::uint32_t     lastRxMs = 0, lastPingMs = 0, lastInviteMs = 0, pingId = 0;
+    FecSlot*          fecSlots = nullptr;      // caller-owned; null = FEC sending off
+    std::uint8_t      fecCapacity = 0;         // how many repeats (§7.2.2)
+    std::uint8_t      fecUsed = 0;             // how many slots currently hold data
+
     std::uint32_t     lastUmpTxMs = 0;         // last UMP Data we sent (§7.2.1)
     bool              haveSentUmp = false;     // ...of non-zero length, ever
     std::uint8_t      idleSent = 0;            // zero-length declarations this idle run
