@@ -31,10 +31,15 @@ if(NOT NETMIDI2_SKIP_TESTS)
     target_link_libraries(nm2_protocol_guards PRIVATE netmidi2)
     add_test(NAME nm2_protocol_guards COMMAND nm2_protocol_guards)
 
-    # Loopback test — runs a Host + Client Session over real localhost UDP (POSIX only).
+    # Socket-backed tests — real localhost UDP (POSIX only).
     if(UNIX)
         add_executable(nm2_session_loopback tests/session_loopback.cpp)
         target_link_libraries(nm2_session_loopback PRIVATE netmidi2)
         add_test(NAME nm2_session_loopback COMMAND nm2_session_loopback)
+
+        # One Host port serving several Clients (spec 3.2).
+        add_executable(nm2_host_multiclient tests/host_multiclient.cpp)
+        target_link_libraries(nm2_host_multiclient PRIVATE netmidi2)
+        add_test(NAME nm2_host_multiclient COMMAND nm2_host_multiclient)
     endif()
 endif()

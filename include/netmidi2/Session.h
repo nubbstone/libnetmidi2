@@ -133,7 +133,14 @@ public:
         return plat.socket->send (peer, buf, w.size()) >= 0;
     }
 
-    // Pump the session: drain the socket, run keepalive/retry/timeout timers.
+    /*  Pump the session: drain the socket, then run the clocks.
+
+        This is the standalone form, for a Session that has a socket to itself. When
+        several Sessions share one UDP port -- which is how a Host serves more than
+        one Client (§3.2) -- exactly one thing may drain that socket, or they steal
+        each other's datagrams. In that arrangement HostPort does the draining and
+        calls deliver() and tickTimers() instead; do not also call tick().
+    */
     void tick() noexcept
     {
         std::uint8_t buf[kMaxDatagram];
@@ -146,6 +153,19 @@ public:
             handleDatagram (buf, std::size_t (n), from);
         }
 
+        tickTimers();
+    }
+
+    // Hand this Session one datagram that was received for it. Pairs with
+    // tickTimers(); see tick() for why they are separable.
+    void deliver (const std::uint8_t* data, std::size_t len, const Endpoint& from) noexcept
+    {
+        handleDatagram (data, len, from);
+    }
+
+    // Run the retry / keepalive / timeout clocks, without touching the socket.
+    void tickTimers() noexcept
+    {
         const std::uint32_t now = plat.clock->nowMs();
 
         if (st == State::inviting)
@@ -414,7 +434,7 @@ private:
          * retransmitting until told. Note this deliberately does NOT establish
          * anything: an Accepted from an endpoint we did not invite must never open a
          * session, or anyone on the LAN could hand us one unasked. */
-        sendByeTo (from, ByeReason::noPendingInvitation);
+        sendByeTo (from, ByeReason::noPendingSession);
     }
 
     void onPing (const ParsedCommand& c, const Endpoint& from) noexcept
