@@ -64,6 +64,19 @@ public:
         std::uint32_t inviteTimeoutMs = 10000; // stop inviting, send Bye (§6.2)
         std::uint32_t byeRetryMs = 500;        // repeat an unanswered Bye (§6.16)
         std::uint32_t byeTimeoutMs = 3000;     // give up waiting for the Bye Reply
+
+        /*  Idle declaration (§7.2.1). The first zero-length UMP Data "shall be sent
+            within 300ms after the most recent UMP Data Command which had a non-zero
+            length"; after that the interval should grow and eventually stop. Each
+            successive gap is idleDeclareMs << n, so 250 / 500 / 1000 / 2000 / 4000
+            by default, then silence.
+
+            Set idleDeclareCount to 0 to send none -- the spec asks a Sender to
+            consider that "the Receiver may have restrictions such as battery
+            operation or limited processing in which it would prefer to not
+            consistently receive data". */
+        std::uint32_t idleDeclareMs = 250;
+        std::uint8_t  idleDeclareCount = 5;
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -130,6 +143,16 @@ public:
         if (! (w.writeSignature() && writeUmpData (w, txSeq, words, count) && w.ok()))
             return false;
         ++txSeq;
+
+        // Real data restarts the idle clock and the backoff (§7.2.1): the first
+        // zero-length declaration is measured from the last NON-zero-length command.
+        if (count > 0)
+        {
+            haveSentUmp = true;
+            idleSent    = 0;
+        }
+        lastUmpTxMs = plat.clock->nowMs();
+
         return plat.socket->send (peer, buf, w.size()) >= 0;
     }
 
@@ -190,6 +213,7 @@ public:
         {
             if (now - lastPingMs >= timing.pingIntervalMs)
                 sendPing();
+            declareIdleIfDue (now);
             if (now - lastRxMs >= timing.timeoutMs)
                 close (ByeReason::timeout);
         }
@@ -267,18 +291,27 @@ private:
      *   we are mid-handshake with. onInvitationAccepted establishes ONLY for the
      *   endpoint we actually invited; for anyone else it just answers.
      *
-     *   Ping while no session is at stake, which peers use to probe liveness before
-     *   inviting -- answering costs nothing and refusing would make an idle host
-     *   look dead. */
+     *   Ping, in ANY state and from anyone. §6.1 Table 9 lists Ping among the
+     *   commands valid in "Every State", and §6.13 says "A Host or Client may send a
+     *   Ping Command at any time and in any Session State" -- it is how a peer
+     *   checks we are alive before bothering to invite us. We used to answer only
+     *   while sessionless, which meant a Host busy with one Client looked dead to
+     *   everybody else, exactly when a prober most wants to know otherwise.
+     *
+     *   Answering is safe purely because touch() is gated below: a stranger's Ping
+     *   is replied to but does NOT refresh the liveness timer, so it cannot hold a
+     *   dead session open. That gate is the load-bearing part -- the two used to be
+     *   welded together, and refusing the Ping was how the timer was protected. The
+     *   `liveness:` checks exist to keep them separate. */
     static bool admits (Command code, bool fromPeer, bool sessionless) noexcept
     {
+        (void) sessionless;
         if (fromPeer)
             return true;
-        if (code == Command::invitation
+        return code == Command::invitation
             || code == Command::bye
-            || code == Command::invitationReplyAccepted)
-            return true;
-        return sessionless && code == Command::ping;
+            || code == Command::invitationReplyAccepted
+            || code == Command::ping;
     }
 
     // The commands this implementation actually acts on. Anything else -- including
@@ -360,7 +393,7 @@ private:
             case Command::invitation:              onInvitation (from);    break;
             case Command::invitationReplyAccepted: onInvitationAccepted (from, fromPeer); break;
             case Command::ping:                    onPing (c, from);       break;
-            case Command::pingReply:               break; // liveness already refreshed
+            case Command::pingReply:               onPingReply (c);        break;
             case Command::umpData:                 onUmpData (c);          break;
             case Command::bye:                     onBye (from, fromPeer); break;
             case Command::byeReply:                onByeReply();           break;
@@ -435,6 +468,27 @@ private:
          * anything: an Accepted from an endpoint we did not invite must never open a
          * session, or anyone on the LAN could hand us one unasked. */
         sendByeTo (from, ByeReason::noPendingSession);
+    }
+
+    /*  §6.14: the Ping Id exists "to match a received Ping Reply Command to a
+        previously sent Ping Command", so match it rather than taking any Ping Reply
+        as proof of life. Liveness itself is refreshed by touch() on the way in, as
+        it is for every command from our peer; this is the narrower question of
+        whether the peer answered the specific Ping we asked.
+
+        We deliberately do NOT send NAK 0x20 (Bad Ping Reply) on a mismatch, though
+        §6.14 permits it. It is a "may", and every way of triggering it here is
+        something UDP does routinely rather than something a peer did wrong: a
+        duplicated datagram arrives after we cleared the outstanding id, or a reply
+        to the previous Ping lands after we have already sent the next one. NAKing a
+        peer for the network's behaviour is worse than staying quiet, and a NAK is
+        not free -- our own NAK handler treats one as a reason to re-invite.
+    */
+    void onPingReply (const ParsedCommand& c) noexcept
+    {
+        if (pingOutstanding && c.payload && get32 (c.payload) == outstandingPingId)
+            pingOutstanding = false;
+        // A mismatch or an unsolicited reply is simply not evidence; ignore it.
     }
 
     void onPing (const ParsedCommand& c, const Endpoint& from) noexcept
@@ -591,6 +645,46 @@ private:
         }
     }
 
+    /*  §7.2.1: "If a Sender has a period where there is no UMP data to send, the
+        Sender shall send a Zero Length UMP Data Command to inform the Receiver that
+        the Sender currently has no further UMP data." The first one is due within
+        300ms of the last non-zero-length command, then "with increasingly longer
+        interval times", and the Sender "should expand the interval between each
+        further Zero Length UMP Data Command and eventually stop".
+
+        Why it matters to the other end: without it, a sender that simply has nothing
+        to play is indistinguishable from one that has died or lost its route. The
+        Receiver is left waiting for its own idle timeout to decide. A zero-length
+        command says "still here, nothing to say" in 12 bytes, and because it carries
+        a Sequence Number like any other UMP Data (§7.2.1) it also keeps the
+        receiver's gap detection honest across a quiet patch.
+
+        Only armed once we have actually sent UMP data: the spec measures the first
+        declaration from "the most recent UMP Data Command which had a non-zero
+        length", so an endpoint that has never sent any has nothing to be idle from.
+        A receive-only peer therefore stays silent rather than chattering.
+    */
+    void declareIdleIfDue (std::uint32_t now) noexcept
+    {
+        if (! haveSentUmp || idleSent >= timing.idleDeclareCount)
+            return;
+
+        // 250, 500, 1000, 2000, 4000... measured from the last thing we sent.
+        const std::uint32_t due = timing.idleDeclareMs << idleSent;
+        if (now - lastUmpTxMs < due)
+            return;
+
+        std::uint8_t buf[kMaxDatagram];
+        Writer w (buf, sizeof buf);
+        if (! (w.writeSignature() && writeUmpData (w, txSeq, nullptr, 0) && w.ok()))
+            return;
+
+        ++txSeq;
+        ++idleSent;
+        lastUmpTxMs = now;
+        plat.socket->send (peer, buf, w.size());
+    }
+
     void deliverUmp (const std::uint8_t* payload, std::uint8_t words) noexcept
     {
         if (! listener) return;
@@ -638,6 +732,8 @@ private:
     {
         lastPingMs = plat.clock->nowMs();
         const std::uint32_t id = ++pingId;
+        outstandingPingId = id;
+        pingOutstanding   = true;
         sendOne ([&] (Writer& w) { return writePing (w, id); });
     }
     void sendPingReply (std::uint32_t id) noexcept { sendOne ([&] (Writer& w) { return writePingReply (w, id); }); }
@@ -688,6 +784,11 @@ private:
     std::uint64_t     rxWindow = 0;    // bit i => (lastRx - i) already processed
 
     std::uint32_t     lastRxMs = 0, lastPingMs = 0, lastInviteMs = 0, pingId = 0;
+    std::uint32_t     lastUmpTxMs = 0;         // last UMP Data we sent (§7.2.1)
+    bool              haveSentUmp = false;     // ...of non-zero length, ever
+    std::uint8_t      idleSent = 0;            // zero-length declarations this idle run
+    std::uint32_t     outstandingPingId = 0;   // the Ping we are waiting on (§6.14)
+    bool              pingOutstanding = false;
 
     std::uint32_t     inviteStartMs = 0;                  // when this invitation began
     std::uint32_t     byeStartMs = 0, lastByeMs = 0;      // Pending Bye timers

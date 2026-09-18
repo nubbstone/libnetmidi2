@@ -16,8 +16,13 @@ multi-byte fields are **big-endian (network byte order), unsigned** (§5.3).
 ## 1. Transport & framing
 
 - **UDP, peer-to-peer.** Host ↔ Client (roles in §4). No broadcast/multicast for data.
-- **Max UDP payload 1400 bytes** (§5.1.1) — never fragment. Implementations must
-  keep each datagram ≤ 1400 bytes.
+- **Max UDP payload 1400 bytes.** §5.1.1 words this as a *should*, not a shall:
+  "UDP packets should not exceed 1400 bytes." This profile treats it as a hard cap
+  anyway, and so does the code (`kMaxDatagram`), because the spec's own reason for
+  the limit is decisive on the hardware we target — "certain embedded UDP stacks do
+  not support fragmentation and will simply not process fragmented UDP packets". A
+  fragmented datagram is not slow on such a peer, it is invisible. Being stricter
+  than the spec is safe here; being laxer is not.
 - Each UDP datagram = a **4-byte Signature** followed by **one or more Command Packets**.
 
 ### 1.1 Signature (§5.2)
@@ -166,9 +171,25 @@ Ping:       code=0x20 | payloadLen=1 | cmdSpecific=0 | payload: Ping Id (32-bit)
 Ping Reply: code=0x21 | payloadLen=1 | cmdSpecific=0 | payload: Ping Id (echoed)
 ```
 
-Either side may Ping at any time/state. The receiver echoes the Ping Id in a Reply.
-Used for keepalive + stale detection: if pings go unanswered for too long, send
-**Bye reason `0x04` (Timeout)**.
+Either side may Ping **at any time and in any Session State** (§6.13), and §6.1
+Table 9 lists Ping, Ping Reply, NAK and Bye as valid in *Every State*. The receiver
+echoes the Ping Id in a Reply. Used for keepalive + stale detection: if pings go
+unanswered for too long, send **Bye reason `0x04` (Timeout)**.
+
+**Answer a Ping from anyone, including mid-session with someone else.** A peer pings
+to check we are alive before bothering to invite us; a Host busy with one Client that
+stayed silent would look dead to every other box on the LAN. This is only safe
+because answering is separated from liveness: a stranger's Ping is replied to but
+must **not** refresh the idle timer, or it can hold a dead session open indefinitely.
+Those two were once welded together — refusing the Ping *was* how the timer was
+protected — and the `liveness:` tests exist to keep them apart.
+
+The Ping Id "shall not be used for any purpose other than this identifier" (§6.13);
+its job is matching a Reply to the Ping that caused it. §6.14 *permits* NAK `0x20`
+(Bad Ping Reply) for an unsolicited or mismatched Reply and we decline to send it:
+every way of triggering it is something UDP does routinely — a duplicated datagram,
+or a reply to the previous Ping landing after the next one went out — and NAKing a
+peer for the network's behaviour is worse than staying quiet.
 
 ### 3.5 Bye / Bye Reply — `0xF0` / `0xF1` (§6.16–6.17)
 
@@ -366,6 +387,30 @@ Anything older than the window is treated as already-seen.
 
 Zero-length UMP Data carries a Sequence Number like any other (§7.2.1), so it enters
 the window too, even though there is nothing to deliver.
+
+### 5.2 Declaring an idle period (§7.2.1)
+
+A Sender with nothing to send **shall** say so, with a zero-length UMP Data command:
+the first within **300ms** of the last non-zero-length one, then "with increasingly
+longer interval times", eventually stopping.
+
+This is easy to dismiss as optional politeness. It is not: without it a sender that
+merely has nothing to play is indistinguishable from one that has crashed or lost its
+route, and the receiver can only sit out its own idle timeout to find out. Twelve
+bytes say "still here, nothing to say", and because the command carries a Sequence
+Number like any other the receiver's gap detection stays honest across the quiet
+patch.
+
+We send `idleDeclareMs << n` apart — 250 / 500 / 1000 / 2000 / 4000 by default — then
+stop. Two deliberate limits:
+
+- **Only after we have actually sent UMP data.** The spec measures the first
+  declaration from "the most recent UMP Data Command which had a non-zero length", so
+  an endpoint that has never sent any has nothing to be idle from. A receive-only
+  peer stays silent instead of chattering.
+- **`idleDeclareCount = 0` disables it entirely.** §7.2.1 asks a Sender to consider
+  that "the Receiver may have restrictions such as battery operation or limited
+  processing in which it would prefer to not consistently receive data".
 
 **Out-of-order commands are delivered, not held back.** An unseen Sequence Number is
 passed on whatever its position, because that is exactly how FEC repairs a gap: the
