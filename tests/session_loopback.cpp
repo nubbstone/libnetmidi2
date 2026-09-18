@@ -608,7 +608,7 @@ int main()
             Command code {}; std::uint8_t d1 = 0; std::uint32_t word0 = 0;
             const bool got = farRecvFirst (code, d1, word0);
             check (got && code == Command::bye
-                       && d1 == std::uint8_t (ByeReason::noPendingInvitation),
+                       && d1 == std::uint8_t (ByeReason::noPendingSession),
                    "spec-reply: an unsolicited Accepted earns Bye 0x06");
         }
         check (idleHost.state() == State::idle,
@@ -901,7 +901,7 @@ int main()
 
         { std::uint8_t in[256]; Endpoint f; while (lazyPeer.receive (in, sizeof in, f) > 0) {} }
 
-        goodbye.close (ByeReason::userRejected);
+        goodbye.close (ByeReason::userTerminated);
         check (goodbye.state()==State::closing,
                "bye-repeat: close() enters Pending Bye, not Closed");
 
@@ -917,7 +917,7 @@ int main()
                 fromPeerAddr = from;
                 parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
                     if (c.code == Command::bye
-                        && c.data1() == std::uint8_t (ByeReason::userRejected))
+                        && c.data1() == std::uint8_t (ByeReason::userTerminated))
                         ++byes;
                 });
             }

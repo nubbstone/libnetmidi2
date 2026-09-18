@@ -52,18 +52,36 @@ enum class Command : std::uint8_t
     byeReply                = 0xF1,
 };
 
-// A few well-known reason codes (PROTOCOL.md §3.5–3.6). Not exhaustive.
+/*  Bye reasons, complete, from §6.16 Table 27.
+
+    Transcribed from the table rather than remembered: the previous short list had
+    0x40 as "user rejected", which is wrong. 0x40 is "too many opened sessions" --
+    the answer a full Host owes an Invitation it has no room for -- and the user's
+    refusal is 0x42. The two are easy to confuse and mean opposite things to the
+    peer: one says come back later, the other says you are not welcome.
+*/
 enum class ByeReason : std::uint8_t
 {
-    undefined            = 0x00,
-    timeout              = 0x04,
-    sessionNotEstablished = 0x05,
-    noPendingInvitation  = 0x06,
-    userRejected         = 0x40,
-    rejectedNoPrior      = 0x41,
-    authFailed           = 0x43,
-    noMatchingAuth       = 0x45,
-    invitationCanceled   = 0x80,
+    // — sent by either Client or Host —
+    undefined             = 0x00,  // Unknown or Undefined
+    userTerminated        = 0x01,  // User terminated session
+    powerDown             = 0x02,
+    tooManyMissingPackets = 0x03,  // cannot recover
+    timeout               = 0x04,  // e.g. too many bad/missing ping responses
+    sessionNotEstablished = 0x05,  // one end believes there is a Session, the other does not
+    noPendingSession      = 0x06,
+    protocolError         = 0x07,  // e.g. name / Product Instance Id missing from an Invitation
+
+    // — Host to Client —
+    tooManySessions       = 0x40,  // Invitation Failed: too many opened sessions
+    authRejectedNoPrior   = 0x41,  // Invitation with Auth without a prior plain Invitation
+    userDidNotAccept      = 0x42,  // Invitation Rejected: user did not accept session
+    authFailed            = 0x43,  // Invitation Rejected: authentication failed
+    usernameNotFound      = 0x44,  // Invitation Rejected: username not found
+    noMatchingAuth        = 0x45,  // No Matching Authentication Method
+
+    // — Client to Host —
+    invitationCanceled    = 0x80,
 };
 
 // §6.15, Table 25.

@@ -182,10 +182,35 @@ The Bye payload is a **Text Message**, not an echoed command header (§6.16 Tabl
 — that is NAK's payload, see §3.6. We send `pl = 0`.
 
 Graceful close from either side; the peer answers Bye Reply, then both go Idle.
-**Bye reason codes seen in the spec** (partial): `0x00` undefined, `0x04` Timeout,
-`0x05` Session not Established, `0x06` No Pending Invitation, `0x40` reject (user),
-`0x41` Rejected (no prior session), `0x43` Authentication failed, `0x45` No matching
-Auth method, `0x80` Invitation Canceled.
+
+**Bye reasons — the complete list (§6.16 Table 27).** An earlier version of this
+document had `0x40` as "reject (user)". It is not: `0x40` is *too many opened
+sessions* and the user's refusal is `0x42`. They mean opposite things to the peer —
+one says come back later, the other says you are not welcome.
+
+| | Sent by either end |
+|---|---|
+| `0x00` | Unknown or Undefined |
+| `0x01` | User terminated session |
+| `0x02` | Power Down |
+| `0x03` | Too Many Missing UMP Packets — cannot recover |
+| `0x04` | Timeout |
+| `0x05` | Session Not Established |
+| `0x06` | No Pending Session |
+| `0x07` | Protocol Error (e.g. name / Product Instance Id missing from an Invitation) |
+
+| | Host → Client |
+|---|---|
+| `0x40` | **Invitation Failed: too many opened sessions** |
+| `0x41` | Invitation with Authentication Rejected: no prior plain Invitation |
+| `0x42` | Invitation Rejected: user did not accept session |
+| `0x43` | Invitation Rejected: authentication failed |
+| `0x44` | Invitation Rejected: username not found |
+| `0x45` | No Matching Authentication Method |
+
+| | Client → Host |
+|---|---|
+| `0x80` | Invitation Canceled |
 
 **Always acknowledge a Bye.** §6.16: "Because the Bye Command might be repeated, the
 Bye Reply shall also be sent if there is no Pending or Established Session." Send
@@ -282,6 +307,25 @@ bidirectionally once Established. *(Open to revisiting — see §6.)*
 There is **no fixed UDP port.** The Host binds a port of its choosing and advertises
 it in the mDNS SRV record; the Client learns it via discovery. For bring-up before
 mDNS exists, allow an **explicit `host:port`** override on both ends.
+
+**One Host port serves every Client (§3.2).** "A Host shares its UDP port with all
+Clients... When serving multiple Clients, the Host shall uniquely identify the
+connection for each Client via the Client's source IP address and UDP port number of
+the incoming UDP packets." A Client allocates its own port per session (§3.3), so the
+source endpoint is what separates conversations.
+
+A second port per extra Client is **not** an alternative: a Host advertises exactly
+one port in its SRV record, so every Client that discovers it aims at that one. In
+this library a `Session` holds a single peer, so `HostPort` owns the socket and routes
+datagrams to N Sessions by source endpoint — see `include/netmidi2/HostPort.h`. A
+Client sees no difference; this is entirely a Host-side concern.
+
+A Host with no free slot answers an Invitation with **Bye `0x40`** (too many opened
+sessions) rather than ignoring it — otherwise a full Host is indistinguishable from
+an absent one, and the Client retries until its own invite timeout. The Bye ends the
+Client's pending invitation, so getting in later is a deliberate new Invitation.
+(§6.6 Invitation Reply: Pending — "wait, a slot may free up" — is the nicer answer,
+and is Phase 2.)
 
 ### 4.4 Discovery — mDNS / DNS-SD (§4)
 

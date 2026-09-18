@@ -59,7 +59,18 @@ Session.h    the state machine on top: Role (host/client),
              Delivers received UMP + state changes via ISessionListener.
 Platform.h   injected I/O: IUdpSocket (non-blocking send/recv), IClock (millis),
              IDiscovery (mDNS, optional). Bundled in a Platform struct.
+HostPort.h   one UDP port, many Clients (§3.2): owns the shared socket and routes
+             each datagram to a Session by source endpoint. Host-side only.
 ```
+
+**One Session is one conversation, not one Host.** §3.2 requires a Host to serve all
+its Clients from a single port, identifying each by source address+port — and a Host
+advertises only one port over mDNS, so binding an extra port per Client is not a
+workaround, it just means the second Client to discover you is ignored. Use
+`HostPort` with N Session slots for any Host that might face more than one peer.
+Exactly one thing may drain a shared socket, so with `HostPort` you call
+`port.tick()` and never `session.tick()` — the Session halves are `deliver()` and
+`tickTimers()`, which is what HostPort drives.
 
 Consumer flow: implement the `Platform` interfaces → construct a `Session` → call
 `connect()` (client) or `listen()` (host) → drive `tick()` frequently → send with
@@ -69,12 +80,13 @@ runnable example with POSIX adapters.
 ## Repository layout
 
 ```
-include/netmidi2/  Protocol.h · Platform.h · Session.h   (the whole library)
+include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h  (the library)
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
 tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
                    protocol_guards.cpp     — malformed/oversized input rejection (unit)
                    session_loopback.cpp    — Host+Client over real localhost UDP
-CMakeLists.txt     INTERFACE target `netmidi2` + all three tests (add_test)
+                   host_multiclient.cpp    — one Host port, several Clients (§3.2)
+CMakeLists.txt     INTERFACE target `netmidi2` + all four tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder — unset)
@@ -118,6 +130,9 @@ Three suites:
 - **`nm2_protocol_guards`** (unit, no sockets). The *reject* paths: `Writer` overflow,
   the §7.1 64‑word limit, bad signature, truncated command. Everything here arrives
   from the network, so none of it may be assumed well‑formed.
+- **`nm2_host_multiclient`** (integration, POSIX). Two Clients on one Host port:
+  both establish, traffic routes by sender with no crosstalk, a third is refused with
+  Bye `0x40` rather than silence, and a vacated slot is reused.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
