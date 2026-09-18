@@ -46,5 +46,10 @@ if(NOT NETMIDI2_SKIP_TESTS)
         add_executable(nm2_discovery tests/discovery.cpp)
         target_link_libraries(nm2_discovery PRIVATE netmidi2)
         add_test(NAME nm2_discovery COMMAND nm2_discovery)
+
+        # FEC sending (spec 7.2.2) — repeat ordering, size limit, idle interaction.
+        add_executable(nm2_fec_sending tests/fec_sending.cpp)
+        target_link_libraries(nm2_fec_sending PRIVATE netmidi2)
+        add_test(NAME nm2_fec_sending COMMAND nm2_fec_sending)
     endif()
 endif()

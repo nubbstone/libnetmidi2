@@ -89,7 +89,8 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
                    session_loopback.cpp    — Host+Client over real localhost UDP
                    host_multiclient.cpp    — one Host port, several Clients (§3.2)
                    discovery.cpp           — mDNS contract + limits, fake adapter (§4)
-CMakeLists.txt     INTERFACE target `netmidi2` + all five tests (add_test)
+                   fec_sending.cpp         — FEC repeat order, size cap, idle (§7.2.2)
+CMakeLists.txt     INTERFACE target `netmidi2` + all six tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT, © Nubbstone
@@ -120,10 +121,10 @@ LICENSE            MIT, © Nubbstone
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # all five suites
+ctest --test-dir build --output-on-failure     # all six suites
 ```
 
-Five suites:
+Six suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
@@ -140,6 +141,10 @@ Five suites:
   service type and field limits, identity validation (including the byte‑vs‑glyph
   trap), a browse resolving into a real session, `lost` events, and the §4.4 join —
   that the name a Host *advertises* is the name it *invites with*.
+- **`nm2_fec_sending`** (integration, POSIX). §7.2.2 on the sending side: repeats
+  prepended oldest‑first with the new command last, the oldest dropped rather than
+  bursting 1400 bytes, a round trip proving our own receiver deduplicates what our
+  sender emits, and the idle‑period interaction with §7.2.1.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
@@ -184,6 +189,13 @@ Invitation: it expires into a Bye and Pending Bye rather than retrying forever
 (§6.2). `State` gained `closing` between `established` and `closed`, so a consumer
 switching exhaustively over it will need a new arm.
 
+**FEC sending is opt‑in; FEC receiving is not.** `setFecSlots()` lends the Session
+caller‑owned storage for recently sent commands — a slot is sized for the largest
+legal command, so a Session that does not want the memory pays none of it. Receiving
+repeats has no switch and never did: §7.2.2 makes coping with them a receiver
+`shall`, because the peer may send them whatever we do. When touching this, the rule
+that looks like style and is not: repeats go **oldest‑first, new command last**.
+
 **Discovery is a contract here, not an implementation.** `Discovery.h` has no mDNS
 responder and must not grow one — multicast, record encoding and a TTL cache are
 adapter territory (prime directives 1 and 3). What *does* belong here is anything the
@@ -219,7 +231,8 @@ explicit `host:port`.
 | Next | |
 |---|---|
 | ~~mDNS discovery contract + orchestration~~ | **done** (`Discovery.h`; the responder itself is adapter work) |
-| FEC (redundant UMP Data in a datagram) + Retransmit (`0x80`/`0x81`) | planned |
+| ~~FEC sending~~ (receiving always worked) | **done** (`Session::setFecSlots`) |
+| Retransmit (`0x80` Request / `0x81` Error, §7.2.3–7.2.4) | planned |
 | Authentication (Invitation with Auth `0x02`/`0x03`, nonce/sha256) | planned |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
