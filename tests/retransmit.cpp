@@ -401,8 +401,13 @@ int main()
         };
         sendSeq (0); sendSeq (5);         // a gap at 1
 
-        int requests = 0;
-        for (int i = 0; i < 1500; ++i)
+        /* Phase 1: answer requests with NAK 0x01, as a peer without Retransmit must
+         * ("shall reply... with a NAK Command with reason 0x01", §7.2.3). Run only
+         * until a NAK has actually been delivered -- how MANY requests escape before
+         * it lands is a race with the runner's speed, and asserting a number there
+         * is what made the first version of this fail on slow CI. */
+        int requests = 0, naksSent = 0;
+        for (int i = 0; i < 4000 && naksSent == 0; ++i)
         {
             receiver.tick(); usleep (500);
             std::uint8_t in[512]; Endpoint f; int n = 0;
@@ -410,15 +415,31 @@ int main()
                 parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
                     if (c.code != Command::retransmitRequest) return;
                     ++requests;
-                    // "shall reply ... with a NAK Command with reason 0x01" (7.2.3)
                     std::uint8_t b[64]; Writer w (b, sizeof b);
                     w.writeSignature();
                     writeNak (w, NakReason::commandNotSupported, c.headerWord());
                     txRaw.send (f, b, w.size());
+                    ++naksSent;
                 });
         }
-        check (requests >= 1, "we asked at least once");
-        check (requests <= 2, "...then stopped: 7.2.3 says do not ask a peer that NAKed");
+        check (requests >= 1 && naksSent >= 1, "we asked, and the peer NAKed");
+
+        // Phase 2: the property that actually matters -- having been NAKed once, it
+        // must never ask again, however long we wait. Comfortably longer than the
+        // 20/40/80ms backoff would need.
+        for (int i = 0; i < 400; ++i) { receiver.tick(); usleep (500); }
+        const int afterNak = requests;
+        for (int i = 0; i < 2000; ++i)
+        {
+            receiver.tick(); usleep (500);
+            std::uint8_t in[512]; Endpoint f; int n = 0;
+            while ((n = txRaw.receive (in, sizeof in, f)) > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::retransmitRequest) ++requests;
+                });
+        }
+        check (requests == afterNak,
+               "...and never asks again: 7.2.3 says do not ask a peer that NAKed");
 
         /* Checking the FINAL state is not enough here, and the weak version of this
          * check passed against a deliberately broken build. The generic NAK handler
