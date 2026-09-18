@@ -89,7 +89,7 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
 CMakeLists.txt     INTERFACE target `netmidi2` + all four tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
-LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder — unset)
+LICENSE            MIT, © Nubbstone
 ```
 
 ## Read these first (in order)
@@ -117,10 +117,10 @@ LICENSE            MIT (copyright holder is a <COPYRIGHT HOLDER> placeholder —
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # conformance vectors + loopback
+ctest --test-dir build --output-on-failure     # all four suites
 ```
 
-Three suites:
+Four suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
