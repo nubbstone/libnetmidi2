@@ -31,9 +31,10 @@ namespace netmidi2
     finished Session stays finished and says so, instead of silently looking ready
     to accept the next stranger that comes along.
 
-    Pending Session Reset (§6.1) is the one spec state still absent.
+    `resetting` is Pending Session Reset (§6.1): we have sent a Session Reset and are
+    waiting for the reply. Every state the spec names is now represented.
 */
-enum class State { idle, inviting, authenticating, established, closing, closed };
+enum class State { idle, inviting, authenticating, established, resetting, closing, closed };
 enum class Role  { host, client };
 
 /*  One previously-sent UMP Data command, kept so it can be sent again.
@@ -86,6 +87,16 @@ public:
         such as triggering an all-notes off" -- because the datagram that went missing
         may well have carried the Note Off. Default is to do nothing. */
     virtual void onUmpLost (std::uint16_t /*sequenceNumber*/) {}
+
+    /*  The session was reset (§6.11): sequence numbers are back to zero on both
+        ends and the resend buffers are empty.
+
+        Worth handling rather than ignoring. §6.11 asks devices to "perform other
+        actions to reset their own state such as notifying the application layer, so
+        it can reset state such as stop hanging notes, for example by issuing an All
+        Notes Off" -- a reset usually follows a stretch of lost data, so whatever was
+        playing may never receive its Note Off. */
+    virtual void onSessionReset() {}
 };
 
 class Session
@@ -137,6 +148,11 @@ public:
             (e.g., 100ms) and double it for every subsequent failed authentication."
             With a 4-digit PIN this delay IS the security -- the hash is not. */
         std::uint32_t authFailDelayMs = 100;
+
+        /*  Session Reset (§6.11) is one of §6.2's repeated commands: resent until
+            the reply arrives or the timeout ends the session with Bye 0x04. */
+        std::uint32_t resetRetryMs = 500;
+        std::uint32_t resetTimeoutMs = 3000;
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -261,7 +277,17 @@ public:
         if (st == State::closing || st == State::closed)
             return;                                  // already tearing down
 
-        if (st == State::established || st == State::inviting)
+        /*  Every live state owes the peer a Bye, not just these two.
+
+            This used to list `established || inviting`, so closing from
+            `authenticating` or `resetting` skipped the Bye and went straight to
+            Closed -- the peer heard nothing and sat out its own idle timeout. §6.11
+            is explicit for the reset case ("On timeout, the session shall be
+            terminated by sending the Bye Command with reason 0x04"), and §6.9 says
+            the same of a pending authentication: "Either side can terminate a
+            pending Invitation with a Bye Command". Written as "anything but idle or
+            closed" so the next state added inherits the right behaviour. */
+        if (st != State::idle)
         {
             byeReason  = reason;
             byeStartMs = plat.clock->nowMs();
@@ -271,6 +297,27 @@ public:
         }
 
         setState (State::closed);                    // idle: nothing to tear down
+    }
+
+    /*  Ask the peer to reset the session (§6.11): sequence numbers back to zero and
+        both resend buffers flushed. For when the two ends have drifted out of sync
+        and recovery is not possible -- §6.11 gives "packets have been lost, 2 devices
+        are out of sync, data recovery is not possible" and aborting an oversized
+        System Exclusive as the motivating cases.
+
+        Not instantaneous: this enters `resetting` (the spec's Pending Session Reset)
+        and repeats until the peer replies, or gives up with Bye 0x04. While waiting,
+        sendUmp() refuses -- §6.11: "the Device shall not send any UMP Data Commands"
+        until the reply arrives. Watch for onSessionReset().
+    */
+    bool resetSession() noexcept
+    {
+        if (st != State::established)
+            return false;
+        resetStartMs = plat.clock->nowMs();
+        sendResetNow();
+        setState (State::resetting);
+        return true;
     }
 
     // Send UMP words (host order) — only valid when Established.
@@ -372,6 +419,17 @@ public:
                 close (ByeReason::timeout);
         }
 
+        if (st == State::resetting)
+        {
+            /* §6.11: repeat until the reply arrives, "On timeout, the session shall
+             * be terminated by sending the Bye Command with reason 0x04 (Timeout)".
+             * Timeout checked first, so giving up does not emit one last Reset. */
+            if (now - resetStartMs >= timing.resetTimeoutMs)
+                close (ByeReason::timeout);
+            else if (now - lastResetMs >= timing.resetRetryMs)
+                sendResetNow();
+        }
+
         if (st == State::closing)
         {
             /* Timeout first, so giving up never emits one last Bye on its way out --
@@ -419,7 +477,8 @@ private:
     bool isFromPeer (const Endpoint& from) const noexcept
     {
         return (st == State::inviting || st == State::authenticating
-                || st == State::established || st == State::closing)
+                || st == State::established || st == State::resetting
+                || st == State::closing)
                && from == peer;
     }
 
@@ -509,6 +568,8 @@ private:
             case Command::invitationWithUserAuth:
             case Command::invitationReplyAuthReq:
             case Command::invitationReplyUserAuth:
+            case Command::sessionReset:
+            case Command::sessionResetReply:
                 return true;
             default:
                 return false;
@@ -543,8 +604,16 @@ private:
          * a Bye Command with reason 0x05". Same rule, same three commands. */
         const bool needsSession = (c.code == Command::umpData
                                    || c.code == Command::retransmitRequest
-                                   || c.code == Command::retransmitError);
-        if (needsSession && ! (fromPeer && st == State::established))
+                                   || c.code == Command::retransmitError
+                                   || c.code == Command::sessionReset
+                                   || c.code == Command::sessionResetReply);
+
+        /* `resetting` is still an active session -- the peer has not reset yet and
+         * may still be sending UMP Data, which §6.11 lets us ignore but certainly
+         * does not let us answer with "no session". Byeing our own peer mid-reset
+         * would turn a resync into a teardown. */
+        const bool inSession = (st == State::established || st == State::resetting);
+        if (needsSession && ! (fromPeer && inSession))
         {
             sendByeTo (from, ByeReason::sessionNotEstablished);
             return true;
@@ -588,6 +657,8 @@ private:
             case Command::nak:                     onNak (c);              break;
             case Command::retransmitRequest:       onRetransmitRequest (c); break;
             case Command::retransmitError:         onRetransmitError();     break;
+            case Command::sessionReset:            onSessionReset();        break;
+            case Command::sessionResetReply:       onSessionResetReply();   break;
             default:                               break; // ignore for Phase 1
         }
     }
@@ -1148,6 +1219,68 @@ private:
         probably lost and cannot be retrieved" -- so stop asking and tell the
         application, which is the only layer that knows whether a missing note matters
         enough to warrant an all-notes-off. */
+    /*  The peer wants a reset (§6.11). "On reception of the Session Reset Command,
+        the Receiver shall respond with the Session Reset Reply Command and reset the
+        session" -- reply first, then reset, so the reply is not built from
+        already-cleared state. */
+    void onSessionReset() noexcept
+    {
+        sendOne ([] (Writer& w) { return writeSessionResetReply (w); });
+        applyReset();
+        setState (State::established);
+    }
+
+    /*  Our reset was acknowledged (§6.12) -- or was not ours at all.
+
+        §6.12: "If the receiver of a Session Reset Reply Command has not sent a prior
+        Session Reset Command, then the receiver should reset the Session by sending a
+        Session Reset Command." An unsolicited reply means the peer believes a reset
+        happened that we know nothing about, so the two ends now disagree about the
+        sequence numbering. Asking for one ourselves is how that converges, rather
+        than silently carrying on from numbers the peer has already forgotten.
+    */
+    void onSessionResetReply() noexcept
+    {
+        if (st == State::resetting)
+        {
+            applyReset();
+            setState (State::established);
+            return;
+        }
+
+        if (st == State::established)
+            resetSession();
+    }
+
+    /*  §6.11 "How to Reset the Session": "Sequence Numbers shall be set to 0",
+        "Buffers used for FEC and Retransmit shall be flushed", "Allow sending UMP
+        Data again".
+
+        Clearing the RECEIVE window matters as much as the send counter and is easier
+        to forget: the peer restarts at 0, and a window still holding the old numbers
+        would discard those as duplicates it had already seen. */
+    void applyReset() noexcept
+    {
+        txSeq       = 0;
+        haveRx      = false;
+        lastRx      = 0;
+        rxWindow    = 0;
+        historyUsed = 0;
+        gapPending  = false;
+        haveSentUmp = false;
+        idleSent    = 0;
+        retransmitRequests = 0;
+
+        if (listener)
+            listener->onSessionReset();
+    }
+
+    void sendResetNow() noexcept
+    {
+        lastResetMs = plat.clock->nowMs();
+        sendOne ([] (Writer& w) { return writeSessionReset (w); });
+    }
+
     void onRetransmitError() noexcept
     {
         abandonGap();
@@ -1509,6 +1642,7 @@ private:
     std::uint32_t     outstandingPingId = 0;   // the Ping we are waiting on (§6.14)
     bool              pingOutstanding = false;
 
+    std::uint32_t     resetStartMs = 0, lastResetMs = 0;   // Pending Session Reset (§6.11)
     std::uint32_t     inviteStartMs = 0;                  // when this invitation began
     std::uint32_t     byeStartMs = 0, lastByeMs = 0;      // Pending Bye timers
     ByeReason         byeReason = ByeReason::undefined;   // repeated verbatim

@@ -85,8 +85,11 @@ struct Recorder : ISessionListener
     void onStateChanged (State s) override
     {
         state = s;
-        const char* n = s==State::idle?"idle":s==State::inviting?"inviting"
-                      : s==State::established?"established":s==State::closing?"closing":"closed";
+        const char* n = s==State::idle?"idle" : s==State::inviting?"inviting"
+                      : s==State::authenticating?"authenticating"
+                      : s==State::established?"established"
+                      : s==State::resetting?"resetting"
+                      : s==State::closing?"closing" : "closed";
         printf ("  [%s] state -> %s\n", who, n);
     }
 };
@@ -561,14 +564,17 @@ int main()
         check (idleHost.state() == State::idle, "spec-reply: ...and the host stays idle");
 
         // --- §5.5: a command code we do not implement ------------------------
-        // Session Reset (0x82) is a real spec command, Phase 2, unimplemented here.
-        // "Not supported" is exactly what NAK 0x01 is for.
+        // 0x7F is not assigned by the spec at all, which is §5.5's "unknown Command
+        // Code" case exactly. It used to be Session Reset (0x82) here -- until we
+        // implemented Session Reset and this check started failing for the happiest
+        // possible reason. An unassigned code cannot rot that way.
+        const std::uint8_t kUnknownCode = 0x7F;
         std::uint32_t offending = 0;
         {
             std::uint8_t buf[64]; Writer w (buf, sizeof buf);
             w.writeSignature();
-            w.writeHeader (Command::sessionReset, 0, 0);
-            offending = (std::uint32_t (std::uint8_t (Command::sessionReset)) << 24);
+            w.writeHeader (Command (kUnknownCode), 0, 0);
+            offending = (std::uint32_t (kUnknownCode) << 24);
             farEnd.send (ihEp, buf, w.size());
         }
         for (int i = 0; i < 60; ++i) { idleHost.tick(); usleep (1000); }

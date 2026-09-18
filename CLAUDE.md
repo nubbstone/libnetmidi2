@@ -54,7 +54,8 @@ Nothing here should depend on those projects. This is a standalone library.
 Protocol.h   pure wire format: 4-byte "MIDI" signature, 32-bit command header,
              command-code enum, big-endian build/parse (Writer + parseDatagram).
 Session.h    the state machine on top: Role (host/client),
-             State (idle→inviting→established→closing→closed), connect/listen/close/
+             State (idle→inviting→authenticating→established→resetting→
+             closing→closed), connect/listen/close/
              sendUmp/tick, ping keepalive, timeout, Bye, sequence-number dedup.
              Delivers received UMP + state changes via ISessionListener.
 Platform.h   injected I/O: IUdpSocket (non-blocking send/recv), IClock (millis),
@@ -95,7 +96,8 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
                    fec_sending.cpp         — FEC repeat order, size cap, idle (§7.2.2)
                    retransmit.cpp          — request/serve/NAK handling (§7.2.3–7.2.4)
                    auth.cpp                — digests vs the spec's examples (§6.7–6.10)
-CMakeLists.txt     INTERFACE target `netmidi2` + all eight tests (add_test)
+                   session_reset.cpp       — resync both counters (§6.11–6.12)
+CMakeLists.txt     INTERFACE target `netmidi2` + all nine tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT, © Nubbstone
@@ -126,10 +128,10 @@ LICENSE            MIT, © Nubbstone
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # all eight suites
+ctest --test-dir build --output-on-failure     # all nine suites
 ```
 
-Eight suites:
+Nine suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
@@ -158,6 +160,10 @@ Eight suites:
   vectors byte‑for‑byte, nonce generation, the full challenge/response both ways,
   wrong secret and unknown user rejected, Bye `0x45` for a client that cannot
   authenticate, and a host with no `ICrypto` declining to pretend.
+- **`nm2_session_reset`** (integration, POSIX). §6.11–6.12: the exchange both ways,
+  UMP refused while pending, repeat‑then‑Bye‑`0x04` when nobody answers, an
+  unsolicited Reply provoking one of our own, and — the point — that traffic still
+  **flows** afterwards.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
@@ -210,6 +216,20 @@ sized for the largest legal command, so a Session that opts out pays nothing.
 Receiving FEC repeats has no switch and never did — §7.2.2 makes coping with them a
 receiver `shall`, since the peer may send them whatever we do. When touching FEC, the
 rule that looks like style and is not: repeats go **oldest‑first, new command last**.
+
+**Resetting means BOTH counters.** §6.11 resets sequence numbers to zero on each
+end. Clearing only `txSeq` fails silently: the peer restarts at `0`, our replay
+window still holds the old numbers, and everything after the reset is dropped as a
+duplicate while the session looks perfectly healthy. `applyReset()` clears the send
+counter, the receive window, the resend history and the gap state together — keep it
+that way, and note the test asserts traffic *flows* after a reset rather than that
+one occurred.
+
+**`close()` owes a Bye from every live state.** It is written as "anything but idle
+or closed" rather than a list, because it once listed only `established` and
+`inviting` — so closing from `authenticating` or `resetting` skipped the Bye entirely
+and left the peer to time out on its own. A new state inherits the right behaviour
+automatically now; do not turn it back into a list.
 
 **No crypto in this library.** SHA‑256 and entropy come through `ICrypto`, so a
 platform uses CommonCrypto, mbedTLS, or a hardware SHA engine. Do not add a built‑in
@@ -267,6 +287,8 @@ explicit `host:port`.
 | ~~FEC sending~~ (receiving always worked) | **done** (`Session::setFecSlots`) |
 | ~~Retransmit (`0x80`/`0x81`)~~ | **done** (shares the sent‑UMP history with FEC) |
 | ~~Authentication (`0x02`/`0x03`, `0x12`/`0x13`)~~ | **done** (`Auth.h`; SHA‑256 + entropy injected via `ICrypto`) |
+| ~~Session Reset (`0x82`/`0x83`)~~ | **done** |
+| Invitation Reply: Pending (`0x11`, §6.6) | the only unimplemented command — a Host stalling while it asks a user; needs UI, so it belongs to the consumer's design more than ours. Currently NAK `0x01`. |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
 ## Reference material

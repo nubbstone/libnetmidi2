@@ -240,6 +240,47 @@ session with is precisely the one that would otherwise retransmit until it times
 out. Acknowledging is not accepting: only our own peer's Bye closes our session —
 letting any sender close it was a real bug (see the `stranger:` tests).
 
+### 3.8 Session Reset — `0x82` / `0x83` (§6.11–6.12)
+
+Puts both ends back to Sequence Number zero without tearing the session down. §6.11's
+cases: "packets have been lost, 2 devices are out of sync, data recovery is not
+possible", or a device wanting to abort something it cannot cope with, such as an
+oversized System Exclusive.
+
+```
+Session Reset:       code=0x82 | payloadLen=0 | cmdSpecific=0 (Reserved)
+Session Reset Reply: code=0x83 | payloadLen=0 | cmdSpecific=0 (Reserved)
+```
+
+Either side may send one during an active Session. It is a §6.2 repeated command:
+resent until the Reply arrives, and **on timeout the session ends with Bye `0x04`**.
+While waiting, the sender "shall not send any UMP Data Commands" and may ignore
+incoming ones. On receiving a Reset, reply **and** reset. Either command arriving
+outside an active session earns **Bye `0x05`**.
+
+**What "reset" means** (§6.11), for both ends:
+
+- Sequence Numbers set to `0`
+- FEC and Retransmit buffers flushed
+- UMP Data may be sent again
+
+**Clearing the receive side matters as much as the send counter, and is the easier
+one to forget.** Resetting only `txSeq` fails in a way that looks like success: the
+peer restarts at `0`, our replay window still remembers the old numbers, and every
+message after the reset is silently dropped as a duplicate "already processed". The
+session stays Established and goes quiet. That is what the `session_reset` test's
+central check is for — it asserts traffic *flows* after a reset, not merely that one
+happened.
+
+§6.11 also suggests "notifying the application layer, so it can reset state such as
+stop hanging notes" — a reset usually follows lost data, so something may be waiting
+for a Note Off that will never come. `ISessionListener::onSessionReset()` is that hook.
+
+**An unsolicited Reply is not noise.** §6.12: a device receiving a Session Reset Reply
+it never asked for "should reset the Session by sending a Session Reset Command". The
+peer believes a reset happened that we know nothing about, so the two ends now
+disagree about the numbering; requesting one is how that converges.
+
 ### 3.7 Authentication — `0x02`/`0x03`, `0x12`/`0x13` (§6.7–6.10)
 
 A Host that wants a password answers an Invitation with a challenge carrying a

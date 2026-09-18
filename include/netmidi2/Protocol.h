@@ -392,6 +392,18 @@ inline bool writeRetransmitError (Writer& w, RetransmitError reason,
         && w.u16 (0);
 }
 
+// Session Reset (§6.11, Table 20) and its reply (§6.12, Table 21). Both are header
+// only: pl = 0, Command Specific Data Reserved and zero.
+inline bool writeSessionReset (Writer& w) noexcept
+{
+    return w.writeHeader (Command::sessionReset, 0, 0);
+}
+
+inline bool writeSessionResetReply (Writer& w) noexcept
+{
+    return w.writeHeader (Command::sessionResetReply, 0, 0);
+}
+
 // NAK (§6.15, Table 24). csd1 = NAK Reason, csd2 = 0 (Reserved — NOT the offending
 // command code). The payload's first word is the header word of the command being
 // NAK'ed, copied verbatim; an optional UTF-8 Text Message may follow, which we do
