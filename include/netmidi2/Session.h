@@ -89,6 +89,24 @@ public:
     State state() const noexcept { return st; }
     const Endpoint& remote() const noexcept { return peer; }
 
+    /*  Client: invite a Host found by discovery (§4).
+
+        The only difference from the explicit-address form is where the address came
+        from -- discovery resolves SRV+A into exactly the host:port a user could have
+        typed. Deliberately does NOT adopt the advertised UMP Endpoint Name as our
+        own: that string is the HOST's identity, and this Session's `name` is ours.
+    */
+    void connect (const DiscoveredHost& host) noexcept
+    {
+        Endpoint e {};
+        std::size_t i = 0;
+        for (; i + 1 < sizeof e.address && host.address[i]; ++i)
+            e.address[i] = host.address[i];
+        e.address[i] = '\0';
+        e.port = host.port;
+        connect (e);
+    }
+
     // Client: start a session by inviting `remotePeer`.
     void connect (const Endpoint& remotePeer) noexcept
     {

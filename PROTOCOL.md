@@ -350,11 +350,54 @@ and is Phase 2.)
 
 ### 4.4 Discovery — mDNS / DNS-SD (§4)
 
-- Service type **`_midi2._udp`**.
-- **PTR** record → service instance name.
-- **SRV** record → hostname + UDP port.
-- **TXT** record keys: `UMPEndpointName`, `ProductInstanceId`.
-- **A / AAAA** → IP address. Respect TTLs (§4.6).
+Optional but recommended, and "the only mechanism defined in this specification for
+automated discovery" (§4.1). Explicit `host:port` remains valid; everything below can
+be skipped. **Only Hosts advertise** — Clients browse (§3.3).
+
+A Host publishes five records for service type **`_midi2._udp`**:
+
+| Record | Carries | Example |
+|---|---|---|
+| **PTR** | the Service Instance Name | `_midi2._udp.local. PTR 173ACE-MIDIWorkbench._midi2._udp.local.` |
+| **SRV** | UDP port + mDNS hostname (must include `.local.`) | `... 60 IN SRV 0 0 5673 desktop.local.` |
+| **TXT** | `UMPEndpointName` + `ProductInstanceId` | `UMPEndpointName=MIDI Workbench` |
+| **A / AAAA** | hostname → one or more IPs | `desktop.local. A 192.168.1.6` |
+
+**Two names, and they are not interchangeable (§4.2).** The *Service Instance Name*
+in the PTR is an internal identifier that "should not be displayed to the user"; it
+should survive power cycles, and the spec suggests building it from the Product
+Instance Id plus a model name. The *UMP Endpoint Name* in the TXT is the one a user
+sees. Showing the PTR name in a device picker is the easy mistake and nothing on the
+wire will complain.
+
+**TXT field limits (§4.4 Table 6)** — `UMPEndpointName` is UTF-8, **≤ 98 bytes**;
+`ProductInstanceId` is ASCII ordinals **32–126**, **≤ 42 bytes**. Both are validated
+in `Discovery.h` before we hand them to an adapter, because over-length yields a
+record some resolvers accept and others silently drop — an interop failure with no
+error anywhere. Note the limit is on **bytes, not characters**: a 34-glyph UTF-8 name
+is 102 bytes and must be rejected, which a glyph count would wave through.
+
+**The advertised identity is the same identity you hand out in the handshake.**
+§4.4: the TXT `UMPEndpointName` "shall be the same name as the UMP Endpoint Name used
+in the Invitation Reply Commands". Nothing enforces this on the wire — publish one
+name and invite with another and discovery still works, the session still
+establishes, and the only symptom is a peer that cannot match the device it dialled
+to the one it thought it dialled. `tests/discovery.cpp` resolves a Host by browsing,
+then reads the Invitation Reply off the wire and compares.
+
+**TTL ≤ 60s (§4.6)**, and the reason is failure rather than tidiness: mDNS defines
+how a Host un-publishes on a clean shutdown, but "there are circumstances, such as a
+cable disconnect or a system crash, where this does not occur". The TTL is the only
+thing that retires a Host that vanished without saying goodbye — which is why the
+`IDiscovery` contract reports **lost** as well as **found**.
+
+**Where the code is.** The protocol core contains no mDNS: a responder needs
+multicast, DNS record encoding and a TTL cache, none of which belong in a
+freestanding core (prime directives 1 and 3). `Discovery.h` defines the contract and
+the checkable limits; the responder itself is an *adapter* — Bonjour / JUCE
+`NetworkServiceDiscovery` on macOS, Avahi on Linux, Zephyr's mDNS responder on the
+Teensy. `HostPort::advertise()` publishes the bound port (the one `bind()` actually
+returned, not the one requested); `Session::connect(const DiscoveredHost&)` dials one.
 
 ---
 

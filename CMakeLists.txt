@@ -41,5 +41,10 @@ if(NOT NETMIDI2_SKIP_TESTS)
         add_executable(nm2_host_multiclient tests/host_multiclient.cpp)
         target_link_libraries(nm2_host_multiclient PRIVATE netmidi2)
         add_test(NAME nm2_host_multiclient COMMAND nm2_host_multiclient)
+
+        # mDNS / DNS-SD discovery (spec 4), driven through a fake adapter.
+        add_executable(nm2_discovery tests/discovery.cpp)
+        target_link_libraries(nm2_discovery PRIVATE netmidi2)
+        add_test(NAME nm2_discovery COMMAND nm2_discovery)
     endif()
 endif()

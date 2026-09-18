@@ -45,6 +45,52 @@ public:
 
     std::size_t capacity() const noexcept { return count; }
 
+    /*  Publish this port over mDNS (§4.2-4.5). Host role only -- Clients browse and
+        do not advertise (§3.3).
+
+        `boundPort` is what IUdpSocket::bind reported, not what was asked for: a
+        Host that requested port 0 and advertises 0 has published a service nobody
+        can reach. It is passed in rather than inferred because the socket belongs
+        to the adapter, which is the only thing that knows.
+
+        The identity strings must be the SAME ones the Sessions send in their
+        Invitation Replies (§4.4). They are validated here rather than at the
+        adapter, because an over-long name yields a record that some resolvers take
+        and others quietly drop -- an interop failure with no error anywhere.
+
+        Returns false, and publishes nothing, if the identity is not spec-legal or
+        there is no discovery adapter.
+    */
+    bool advertise (const char* serviceInstanceName,
+                    std::uint16_t boundPort,
+                    const char* umpEndpointName,
+                    const char* productInstanceId) noexcept
+    {
+        if (plat.discovery == nullptr || boundPort == 0)
+            return false;
+        if (cstrBytes (serviceInstanceName) == 0)
+            return false;
+        if (! isValidUmpEndpointName (umpEndpointName)
+            || ! isValidProductInstanceId (productInstanceId))
+            return false;
+
+        plat.discovery->advertise (serviceInstanceName, boundPort,
+                                   umpEndpointName, productInstanceId);
+        advertising = true;
+        return true;
+    }
+
+    void stopAdvertising() noexcept
+    {
+        if (plat.discovery != nullptr && advertising)
+        {
+            plat.discovery->stopAdvertising();
+            advertising = false;
+        }
+    }
+
+    bool isAdvertising() const noexcept { return advertising; }
+
     // Make every free slot ready to accept an Invitation.
     void listen() noexcept
     {
@@ -161,6 +207,7 @@ private:
     Platform             plat;
     Session* const*      slots;
     std::size_t          count;
+    bool                 advertising = false;
 };
 
 } // namespace netmidi2

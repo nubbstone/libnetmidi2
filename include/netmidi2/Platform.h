@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "Discovery.h"
+
 namespace netmidi2
 {
 
@@ -59,24 +61,9 @@ public:
 };
 
 //==============================================================================
-// mDNS / DNS-SD for `_midi2._udp` (PROTOCOL.md §4.4). Optional for bring-up
-// (explicit host:port works without it).
-class IDiscovery
-{
-public:
-    virtual ~IDiscovery() = default;
-
-    // Host role: advertise this endpoint on the LAN.
-    virtual void advertise (const char* instanceName, std::uint16_t port,
-                            const char* umpEndpointName, const char* productInstanceId) = 0;
-    virtual void stopAdvertising() = 0;
-
-    // Client role: begin browsing. Discovered hosts are delivered via poll().
-    virtual void startBrowsing() = 0;
-
-    // Non-blocking: if a new host was discovered, fill `out` and return true.
-    virtual bool poll (Endpoint& out, char* umpEndpointName, std::size_t nameCap) = 0;
-};
+// IDiscovery (mDNS / DNS-SD for `_midi2._udp`) lives in Discovery.h, with the §4
+// field limits it has to respect. Optional: leave `discovery` null and drive the
+// library with explicit host:port.
 
 //==============================================================================
 // Everything the Session needs from the platform, bundled.

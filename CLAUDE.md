@@ -61,6 +61,8 @@ Platform.h   injected I/O: IUdpSocket (non-blocking send/recv), IClock (millis),
              IDiscovery (mDNS, optional). Bundled in a Platform struct.
 HostPort.h   one UDP port, many Clients (§3.2): owns the shared socket and routes
              each datagram to a Session by source endpoint. Host-side only.
+Discovery.h  the mDNS/DNS-SD contract (§4): IDiscovery, DiscoveredHost, the TXT
+             field limits and TTL ceiling. No responder here — that's an adapter.
 ```
 
 **One Session is one conversation, not one Host.** §3.2 requires a Host to serve all
@@ -80,13 +82,14 @@ runnable example with POSIX adapters.
 ## Repository layout
 
 ```
-include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h  (the library)
+include/netmidi2/  Protocol.h · Platform.h · Session.h · HostPort.h · Discovery.h
 PROTOCOL.md        the wire contract — a readable profile of M2-124-UM
 tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (unit)
                    protocol_guards.cpp     — malformed/oversized input rejection (unit)
                    session_loopback.cpp    — Host+Client over real localhost UDP
                    host_multiclient.cpp    — one Host port, several Clients (§3.2)
-CMakeLists.txt     INTERFACE target `netmidi2` + all four tests (add_test)
+                   discovery.cpp           — mDNS contract + limits, fake adapter (§4)
+CMakeLists.txt     INTERFACE target `netmidi2` + all five tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
 LICENSE            MIT, © Nubbstone
@@ -117,10 +120,10 @@ LICENSE            MIT, © Nubbstone
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # all four suites
+ctest --test-dir build --output-on-failure     # all five suites
 ```
 
-Four suites:
+Five suites:
 
 - **`nm2_conformance_vectors`** (unit, no sockets — builds anywhere). Byte‑for‑byte
   against M2‑124‑UM Appendix A.1 Figures 12–15, in both directions. This is the only
@@ -133,6 +136,10 @@ Four suites:
 - **`nm2_host_multiclient`** (integration, POSIX). Two Clients on one Host port:
   both establish, traffic routes by sender with no crosstalk, a third is refused with
   Bye `0x40` rather than silence, and a vacated slot is reused.
+- **`nm2_discovery`** (integration, POSIX + a fake mDNS adapter). The §4 contract:
+  service type and field limits, identity validation (including the byte‑vs‑glyph
+  trap), a browse resolving into a real session, `lost` events, and the §4.4 join —
+  that the name a Host *advertises* is the name it *invites with*.
 - **`nm2_session_loopback`** (integration, POSIX). Stands up a Host and a Client
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
@@ -177,6 +184,14 @@ Invitation: it expires into a Bye and Pending Bye rather than retrying forever
 (§6.2). `State` gained `closing` between `established` and `closed`, so a consumer
 switching exhaustively over it will need a new arm.
 
+**Discovery is a contract here, not an implementation.** `Discovery.h` has no mDNS
+responder and must not grow one — multicast, record encoding and a TTL cache are
+adapter territory (prime directives 1 and 3). What *does* belong here is anything the
+spec constrains that can be checked without a network: the TXT limits (bytes, not
+glyphs), the TTL ceiling, and the §4.4 rule that the advertised `UMPEndpointName` is
+the same string the Invitation Reply carries. That last one is a cross‑layer
+invariant nothing on the wire enforces, so it is pinned by a test.
+
 **Note on sanitizers:** `-fsanitize=address` is broken on this machine — even a
 hello‑world ASan binary hangs with no output. Use `-fstack-protector-all` (it caught
 the overflow above cleanly, SIGABRT) rather than assuming your code is at fault.
@@ -203,7 +218,7 @@ explicit `host:port`.
 
 | Next | |
 |---|---|
-| mDNS discovery (`_midi2._udp` PTR/SRV/TXT) so peers find each other | planned |
+| ~~mDNS discovery contract + orchestration~~ | **done** (`Discovery.h`; the responder itself is adapter work) |
 | FEC (redundant UMP Data in a datagram) + Retransmit (`0x80`/`0x81`) | planned |
 | Authentication (Invitation with Auth `0x02`/`0x03`, nonce/sha256) | planned |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
