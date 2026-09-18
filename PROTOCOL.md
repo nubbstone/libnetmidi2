@@ -73,8 +73,8 @@ Multiple command packets may be packed into one datagram after the single signat
 | `0x81` | Retransmit Error                    | requested Seq Number   | none                             | both | 2     |
 | `0x82` | Session Reset                       | 0                      | none                             | both | 2     |
 | `0x83` | Session Reset Reply                 | 0                      | none                             | both | 2     |
-| `0x8F` | **NAK**                             | D1=NAK reason, D2=code | echoed command header (+ opt)    | both | 1     |
-| `0xF0` | **Bye**                             | D1=Bye reason          | optional echoed command          | both | 1     |
+| `0x8F` | **NAK**                             | D1=NAK reason, D2=0    | echoed cmd header + opt text     | both | 1     |
+| `0xF0` | **Bye**                             | D1=Bye reason, D2=0    | optional UTF-8 Text Message      | both | 1     |
 | `0xF1` | **Bye Reply**                       | 0                      | none                             | both | 1     |
 
 An unknown Command Code → reply **NAK reason `0x01`** "Command Not Supported" (§5.5).
@@ -232,14 +232,38 @@ aren't in the spec at all. §5.5 requires an answer rather than silence.
 ### 4.1 Session state machine (§6.1)
 
 ```
-Idle ──(send/recv Invitation)──▶ Pending ──(Invitation Reply: Accepted)──▶ Established
-  ▲                                                                            │
-  └──────────────────── Bye / Bye Reply / Timeout ────────────────────────────┘
+Idle ──(Invitation)──▶ Pending Invitation ──(Reply: Accepted)──▶ Established
+ ▲                            │                                      │
+ │                            └── invite timeout ──┐   ┌── Bye / idle timeout ──┘
+ │                                                 ▼   ▼
+ └──────────── Bye Reply / bye timeout ────── Pending Bye
 ```
 
+The spec names six states (§6.1). This library implements the four that Phase 1
+reaches — Idle, Pending Invitation, Established, Pending Bye — as
+`State::idle / inviting / established / closing`, plus a terminal `closed` of its
+own. (§6.3.1 returns both ends to Idle after a teardown; a library is more useful if
+a finished Session stays finished and says so.) Authentication Required and Pending
+Session Reset are Phase 2/3.
+
 - Only in **Established** may either side send **UMP Data**.
-- Most session commands are **repeated until acknowledged** (§7.2 General
-  Considerations); NAK is sent once.
+- **Repeated commands (§6.2).** Invitation and Bye are repeated until answered, at a
+  **300ms–2s** interval. Crucially they are not repeated *forever*: "If a Device
+  reaches its preferred timeout without receiving a suitable reply, then the Device
+  shall cease repeating the Command and send a Bye Command (except for a repeated
+  Bye Command)." NAK has no reply and is sent once.
+  - An unanswered **Invitation** expires into a Bye reason `0x04` and Pending Bye.
+    Without that a client sits in Pending Invitation forever — no timeout, no error,
+    no Bye, nothing the application can act on.
+  - An unanswered **Bye** is retransmitted, then gives up quietly. It does *not*
+    emit another Bye on expiry, per the exception above.
+- **Closing is not instantaneous.** A Bye enters Pending Bye and the session ends on
+  the Bye Reply (§6.17) or the bye timeout. Sending one Bye and declaring yourself
+  closed leaves a peer holding a session you have already dropped if that single
+  datagram is lost.
+- A **Bye Reply is only meaningful in Pending Bye** — §6.17: "If there is no
+  Established Session with the sender of the Bye Reply Command, the receiver shall
+  ignore the Bye Reply Command." One arriving while still inviting is ignored.
 - Ping keepalive runs throughout Established; repeated unanswered pings → Bye `0x04`.
 
 ### 4.2 Roles
