@@ -84,6 +84,13 @@ enum class ByeReason : std::uint8_t
     invitationCanceled    = 0x80,
 };
 
+// §7.2.4, Table 32.
+enum class RetransmitError : std::uint8_t
+{
+    unknown             = 0x00,
+    notInTransmitBuffer = 0x01,   // the requested Sequence Number is no longer held
+};
+
 // §6.15, Table 25.
 enum class NakReason : std::uint8_t
 {
@@ -262,6 +269,47 @@ inline bool writeBye (Writer& w, ByeReason reason) noexcept
 inline bool writeByeReply (Writer& w) noexcept
 {
     return w.writeHeader (Command::byeReply, 0, 0);
+}
+
+/*  Retransmit Request (§7.2.3, Table 30). pl = 1.
+
+        csd            = Sequence Number of the first UMP Data command wanted
+        payload word 0 = Number of UMP Commands (16) | Reserved (16)
+
+    `umpCommandCount` 0 means "send all previously sent UMP Data Commands starting
+    from Sequence Number", and is the only value the table defines. A responder "may
+    ignore the Number of UMP Commands field and send all packets since the specified
+    Sequence Number" regardless, so do not rely on it being honoured.
+*/
+inline bool writeRetransmitRequest (Writer& w, std::uint16_t firstSeq,
+                                    std::uint16_t umpCommandCount = 0) noexcept
+{
+    return w.writeHeader (Command::retransmitRequest, 1, firstSeq)
+        && w.u16 (umpCommandCount)
+        && w.u16 (0);
+}
+
+/*  Retransmit Error (§7.2.4, Table 31). pl = 1.
+
+        csd1           = Error Reason (Table 32), csd2 = 0 (Reserved)
+        payload word 0 = Sequence Number (16) | Reserved (16)
+
+    Table 31 defines that Sequence Number as "the first UMP Data Command that COULD be
+    retransmitted" -- i.e. where the requester should re-ask from. §7.2.3's prose
+    instead says the Error specifies "the first missing Sequence Number", which is a
+    different value. The table wins here, as it has every other time the two have
+    disagreed in this spec (see NAK csd2 and the Bye payload), and it is also the more
+    actionable of the two: a requester can do something with "here is what I still
+    have" and nothing with "here is what you already knew you lost". PROTOCOL.md §5.4
+    records the conflict.
+*/
+inline bool writeRetransmitError (Writer& w, RetransmitError reason,
+                                  std::uint16_t firstAvailableSeq) noexcept
+{
+    const std::uint16_t csd = std::uint16_t (std::uint16_t (std::uint8_t (reason)) << 8);
+    return w.writeHeader (Command::retransmitError, 1, csd)
+        && w.u16 (firstAvailableSeq)
+        && w.u16 (0);
 }
 
 // NAK (§6.15, Table 24). csd1 = NAK Reason, csd2 = 0 (Reserved — NOT the offending

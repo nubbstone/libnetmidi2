@@ -410,8 +410,8 @@ returned, not the one requested); `Session::connect(const DiscoveredHost&)` dial
 - **FEC, both directions.** Senders "should" repeat their previous UMP Data commands
   inside later datagrams (§7.2.2), and *every* receiver must cope with that whether
   or not it sends them itself. See §5.3 below.
-- **Retransmit (Phase 2):** `0x80` Retransmit Request / `0x81` Retransmit Error
-  (§7.2.3–7.2.4).
+- **Retransmit:** `0x80` Retransmit Request / `0x81` Retransmit Error
+  (§7.2.3–7.2.4). See §5.4.
 
 ### 5.1 Dedup needs a window, not a last-seen value
 
@@ -454,6 +454,59 @@ stop. Two deliberate limits:
 - **`idleDeclareCount = 0` disables it entirely.** §7.2.1 asks a Sender to consider
   that "the Receiver may have restrictions such as battery operation or limited
   processing in which it would prefer to not consistently receive data".
+
+### 5.4 Retransmit (§7.2.3–7.2.4)
+
+The targeted counterpart to FEC. FEC repairs blindly by repeating recent commands;
+Retransmit repairs on request, and reaches further back because the responder answers
+from the whole retained history rather than the last two. Optional but recommended,
+and the two work together or separately.
+
+**Requesting.** A Retransmit Request (`0x80`, pl 1) names the first Sequence Number
+wanted in its command-specific data; the payload word is `Number of UMP Commands` +
+Reserved, and `0` means "send everything from there". §7.2.3 asks for a short delay
+before sending one — "for example 10 milliseconds... That will help recovering from
+out of order packets and it prevents sending Retransmit Requests too often" — then
+repeats with increasing delay until the data arrives, an Error or NAK comes back, or
+it gives up. With FEC also running, most gaps are filled by the next datagram's
+repeat before the timer ever fires, so the common case costs nothing.
+
+**Responding**, per §7.2.3, is one of three things: retransmit what was asked for;
+send a Retransmit Error (`0x81`) if the buffer no longer holds it; or NAK `0x01` if
+you do not implement Retransmit at all. Requests received outside an Established
+Session get **Bye `0x05`**, and so do stray Retransmit Errors.
+
+**Two places the spec contradicts itself.** Both are decided here rather than left to
+whoever reads it next:
+
+1. *What to send when only part of the range survives.* §7.2.3: "All UMP Data Commands
+   that are available in the retransmit buffer following the missing packets should
+   still be retransmitted." §7.2.4: "The Device shall not retransmit other available
+   UMP Data Commands." **We follow §7.2.3** — it is the more specific rule, and
+   withholding data that is right there helps nobody, while the requester's dedup
+   window makes an extra command free.
+2. *What Sequence Number the Error carries.* Table 31 defines it as "the first UMP Data
+   Command that **could** be retransmitted"; §7.2.3's prose says "the first **missing**
+   Sequence Number". **We follow Table 31** — as we have every other time table and
+   prose have disagreed in this spec (NAK `csd2`, the Bye payload), and because a
+   requester can act on "here is what I still have" and cannot act on a restatement of
+   what it already knew it had lost.
+
+**Sequence wrap** needs no special handling if the buffer is searched in send order
+rather than by comparing numbers — §7.2.3 warns that a requested range "could start
+with a high number close to the maximum, and then wrap around to 0x0000".
+
+**A NAK of a Retransmit Request is not a session problem.** §7.2.3: a device that does
+not implement Retransmit "shall reply... with a NAK Command with reason 0x01... The
+remote Device should not send Retransmit Request Commands after that." Since a NAK
+echoes the header of the offending command (§6.15), read it before reacting — a
+generic "NAK means re-invite" rule would tear down a healthy session merely for asking
+a question the peer does not answer.
+
+When data is finally unrecoverable the application is told, because it is the only
+layer that can judge the consequences. §7.2.4: "The Device may determine a recovery
+process appropriate to its own implementation... such as triggering an all-notes off"
+— the datagram that went missing may well have carried the Note Off.
 
 ### 5.3 Sending FEC (§7.2.2)
 
