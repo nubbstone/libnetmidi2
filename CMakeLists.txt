@@ -17,6 +17,14 @@ target_compile_features(netmidi2 INTERFACE cxx_std_17)
 
 # Consumers: target_link_libraries(<their_target> PRIVATE netmidi2)
 
+# Interop bench harness. Not a test -- it needs a real peer on the network -- but
+# the thing that found the defects the tests could not, so it ships with the library.
+option(NETMIDI2_BUILD_TOOLS "Build the nm2_bench interop harness" OFF)
+if(NETMIDI2_BUILD_TOOLS AND UNIX)
+    add_executable(nm2_bench tools/nm2_bench.cpp)
+    target_link_libraries(nm2_bench PRIVATE netmidi2)
+endif()
+
 if(NOT NETMIDI2_SKIP_TESTS)
     enable_testing()
 
