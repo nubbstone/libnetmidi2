@@ -97,6 +97,15 @@ public:
         Notes Off" -- a reset usually follows a stretch of lost data, so whatever was
         playing may never receive its Note Off. */
     virtual void onSessionReset() {}
+
+    /*  §6.6: the Host has told us it needs time to decide -- typically because it is
+        asking a user whether to let us in. The invitation is still alive and we are
+        now waiting, patiently, for the Accepted (or a Bye).
+
+        Worth surfacing: from here the handshake can legitimately take as long as a
+        human takes to answer a dialog, and a UI that shows "connecting..." with a
+        short spinner will look broken. Default is to do nothing. */
+    virtual void onInvitationPending() {}
 };
 
 class Session
@@ -153,6 +162,14 @@ public:
             the reply arrives or the timeout ends the session with Bye 0x04. */
         std::uint32_t resetRetryMs = 500;
         std::uint32_t resetTimeoutMs = 3000;
+
+        /*  §6.6: once a Host answers our Invitation with Invitation Reply: Pending,
+            it is allowed to take as long as it needs -- "this might occur when the
+            Host asks the user for permission and is waiting for user
+            acknowledgment". inviteTimeoutMs is a budget for an unanswered
+            invitation; this is the budget for one that HAS been answered, with
+            "wait". A human clicking a dialog is the unit here, not a round trip. */
+        std::uint32_t invitePendingTimeoutMs = 60000;
     };
 
     Session (const Platform& platform, Role role, ISessionListener* listener,
@@ -253,6 +270,7 @@ public:
         if (role == Role::client)
         {
             inviteStartMs = plat.clock->nowMs();   // when to stop trying (§6.2)
+            invitePending = false;                 // a fresh invitation, not yet answered
             sendInvitation();
             setState (State::inviting);
         }
@@ -403,9 +421,14 @@ public:
              * error, no Bye. That is the "client retries forever, nothing times out"
              * half of the handshake deadlock: the host's side was fixed in 141a075,
              * but the client's inability to ever give up was left in place. */
-            if (now - inviteStartMs >= timing.inviteTimeoutMs)
+            /* §6.6: a Host that said "pending" has asked us to wait, so it gets the
+             * long budget and no more repeat Invitations -- repeating at a Host that
+             * has already replied just pesters it while a user decides. */
+            const std::uint32_t budget = invitePending ? timing.invitePendingTimeoutMs
+                                                       : timing.inviteTimeoutMs;
+            if (now - inviteStartMs >= budget)
                 close (ByeReason::timeout);
-            else if (now - lastInviteMs >= timing.inviteRetryMs)
+            else if (! invitePending && now - lastInviteMs >= timing.inviteRetryMs)
                 sendInvitation();
         }
 
@@ -539,6 +562,7 @@ private:
         return code == Command::invitation
             || code == Command::bye
             || code == Command::invitationReplyAccepted
+            || code == Command::invitationReplyPending
             || code == Command::invitationWithAuth
             || code == Command::invitationWithUserAuth
             || code == Command::invitationReplyAuthReq
@@ -557,6 +581,7 @@ private:
             case Command::umpData:
             case Command::invitation:
             case Command::invitationReplyAccepted:
+            case Command::invitationReplyPending:
             case Command::ping:
             case Command::pingReply:
             case Command::bye:
@@ -645,6 +670,7 @@ private:
         {
             case Command::invitation:              onInvitation (c, from); break;
             case Command::invitationReplyAccepted: onInvitationAccepted (from, fromPeer); break;
+            case Command::invitationReplyPending:  onInvitationPending (c, from, fromPeer); break;
             case Command::invitationReplyAuthReq:  onAuthRequired (c, from, false); break;
             case Command::invitationReplyUserAuth: onAuthRequired (c, from, true);  break;
             case Command::invitationWithAuth:      onInvitationWithAuth (c, from, false); break;
@@ -894,6 +920,63 @@ private:
             return;                          // not yet (wrap-safe compare)
         authReplyDue = false;
         sendAuthChallenge();
+    }
+
+    /*  §6.6 Invitation Reply: Pending -- "A Host may send an Invitation Reply
+        Pending Command to inform the Client that the Host needs some time to
+        determine if it can accept the invitation, or under which conditions it can do
+        so (authentication)."
+
+        Found on the bench, not by reading: macOS Tahoe's CoreMIDI sends this on every
+        single connection, immediately before its Accepted. We answered it with NAK
+        0x01 "command not supported", which is wrong in all three arms below. Tahoe
+        ignored the NAK and sent the Accepted anyway so the session still opened --
+        but a Host entitled to take us at our word could reasonably have given up
+        there, and we would have had no idea why.
+
+        We still do not implement the HOST side (choosing to stall while a user is
+        asked is the consumer's UI, not the transport's). The Client side, which is
+        what a conformant Host will exercise, is fully specified and now handled.
+    */
+    void onInvitationPending (const ParsedCommand& c, const Endpoint& from,
+                              bool fromPeer) noexcept
+    {
+        /* §6.6: "If a Host receives this Command, then the Host shall respond with
+         * NAK, reason 0x02 (Command Not Expected)." A Host never has an invitation
+         * outstanding of its own, so this can only be a confused peer. */
+        if (role == Role::host)
+        {
+            sendNakTo (from, NakReason::commandNotExpected, c);
+            return;
+        }
+
+        /* §6.6: "The Client shall wait for a subsequent reply from the Host."
+         *
+         * Waiting means two things, and the second is the one easily missed: stop
+         * repeating the Invitation at the Host, and stop counting down to the §6.2
+         * invite timeout on the old budget. Someone may be looking at a permission
+         * dialog. Ten seconds is not a fair allowance for that, and letting it expire
+         * would Bye an invitation the Host is still actively working on -- the exact
+         * failure the Host used this Command to prevent. */
+        if (fromPeer && st == State::inviting)
+        {
+            invitePending = true;
+            inviteStartMs = plat.clock->nowMs();   // restart, against the long budget
+            listener->onInvitationPending();
+            return;
+        }
+
+        /* §6.6 names Established as a valid state to receive this in, so a Pending
+         * that lost its race with the Accepted is not an error. Ignore it rather than
+         * disturbing a session that is already working -- same hazard as the
+         * duplicate-Accepted case below. */
+        if (fromPeer && st == State::established)
+            return;
+
+        /* §6.6: "If a Client receives this Command when not in a Pending Invitation
+         * or Established Session state, then the Client shall send a Bye Command to
+         * the Host with reason 0x06 (No Pending Invitation)." */
+        sendByeTo (from, ByeReason::noPendingSession);
     }
 
     void onInvitationAccepted (const Endpoint& from, bool fromPeer) noexcept
@@ -1349,6 +1432,14 @@ private:
         // Re-inviting is safe even if the NAK was actually about something else
         // (host role sends none today, so in practice this only fires for a
         // client): worst case is one extra, harmless handshake round-trip.
+        //
+        // TREAT THAT LAST SENTENCE WITH SUSPICION. It is false whenever the NAKed
+        // command is one we will immediately send again on re-establishing, because
+        // then the "one extra round-trip" is a loop -- which is exactly what the
+        // zero-length case below turned out to be. The Teensy measurement quoted
+        // above may well have been this same phenomenon read the other way round.
+        // Before adding another command to the generic path, ask whether a fresh
+        // session would re-send it unprompted.
         /* A NAK echoes the header of the command it is complaining about (§6.15), so
          * read it before reacting. A NAK of our Retransmit Request means only that
          * the peer does not implement Retransmit -- §7.2.3: "it shall reply to the
@@ -1360,11 +1451,40 @@ private:
          * not answer. Stop asking instead. */
         if (c.payload != nullptr && c.payloadWords >= 1)
         {
-            const Command offending = Command (std::uint8_t (get32 (c.payload) >> 24));
+            const std::uint32_t echoed = get32 (c.payload);
+            const Command       offending      = Command (std::uint8_t (echoed >> 24));
+            const std::uint8_t  offendingWords = std::uint8_t (echoed >> 16);
+
             if (offending == Command::retransmitRequest)
             {
                 peerDoesRetransmit = false;
                 abandonGap();
+                return;
+            }
+
+            /* A NAK of a ZERO-LENGTH UMP Data -- one of our §7.2.1 idle declarations.
+             *
+             * The peer is wrong to reject it. §7.1 lists "a zero length payload" as
+             * one of the two legal payloads for UMP Data, and §7.2.1 says a Sender
+             * "shall" send one when it has nothing to play. But the peer has plainly
+             * parsed the command and still holds a session for us, so this is NOT the
+             * "peer forgot us" signal that the generic path below treats it as.
+             *
+             * Letting it fall through was a livelock, found on the bench against a
+             * Teensy running Zephyr's netmidi2.c, which NAKs these with reason 0x03
+             * (commandMalformed): tear down -> re-invite -> establish -> idle timer
+             * fires -> another zero-length -> another NAK. Four full handshakes in
+             * three seconds, indefinitely, and no UMP flowing in between.
+             *
+             * So stop offering what this peer will not take, and leave the session
+             * up. Dropping the declarations costs us only the §7.2.1 keepalive hint;
+             * Ping (§6.13) still proves liveness. §7.2.1 itself invites exactly this
+             * accommodation: a Sender "should consider that the Receiver may have
+             * restrictions... in which it would prefer to not consistently receive
+             * data". */
+            if (offending == Command::umpData && offendingWords == 0)
+            {
+                peerAcceptsIdleDeclarations = false;
                 return;
             }
         }
@@ -1462,6 +1582,9 @@ private:
     */
     void declareIdleIfDue (std::uint32_t now) noexcept
     {
+        if (! peerAcceptsIdleDeclarations)   // it NAKed one; stop offering (§7.2.1)
+            return;
+
         if (! haveSentUmp || idleSent >= timing.idleDeclareCount)
             return;
 
@@ -1635,6 +1758,8 @@ private:
     std::uint32_t     gapSinceMs = 0;
     std::uint8_t      retransmitRequests = 0;  // how many times we have asked
     bool              peerDoesRetransmit = true;  // until it NAKs us (§7.2.3)
+    bool              peerAcceptsIdleDeclarations = true; // until it NAKs one (§7.2.1)
+    bool              invitePending = false;      // Host replied "pending" (§6.6)
 
     std::uint32_t     lastUmpTxMs = 0;         // last UMP Data we sent (§7.2.1)
     bool              haveSentUmp = false;     // ...of non-zero length, ever

@@ -98,6 +98,9 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
                    retransmit.cpp          — request/serve/NAK handling (§7.2.3–7.2.4)
                    auth.cpp                — digests vs the spec's examples (§6.7–6.10)
                    session_reset.cpp       — resync both counters (§6.11–6.12)
+tools/             nm2_bench.cpp — interop harness: drives a real Session against a
+                   real peer and prints every datagram. The only thing that can catch
+                   what our own code and our own tests already agree about.
 CMakeLists.txt     INTERFACE target `netmidi2` + all nine tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check
@@ -169,7 +172,8 @@ Nine suites:
   `Session` over real localhost UDP: full handshake → both Established, bidirectional
   UMP delivery, duplicate‑sequence ignored, recovery from a lost InvitationAccepted,
   NAK re‑invite, stranger traffic rejected, oversized UMP Data rejected, the §7.1 /
-  §5.5 replies owed to a sender we have no session with, FEC repeats deduplicated
+  §5.5 replies owed to a sender we have no session with, the three arms of §6.6
+  Invitation Reply: Pending (wait / Bye `0x06` / NAK `0x02`), FEC repeats deduplicated
   across a 64‑entry window (including the `0xFFFF` wrap), an unanswered Invitation
   expiring into Bye `0x04`, a Bye retransmitted until acknowledged, zero‑length idle
   declarations with their backoff (§7.2.1), liveness timeout, graceful Bye → Closed.
@@ -252,6 +256,16 @@ failure delay *is* the defence, and digest comparison must stay constant‑time.
 themselves; PROTOCOL.md §3.7 argues the reading from their own `pl` ranges. If a real
 peer disagrees about those two commands, start there — the digests are solid.
 
+**A NAK is not automatically a session problem, and re-inviting can be a loop.**
+Before the generic "re-invite" default takes on a new command, ask: *would a fresh
+session send this again, unprompted?* If yes, the default is not one extra round-trip,
+it is a livelock. Not hypothetical — the Teensy NAKs our zero-length idle declarations
+(§7.2.1) as malformed, which produced four full handshakes in three seconds with no UMP
+moving between them, until `onNak` learned to recognise them and set
+`peerAcceptsIdleDeclarations = false` instead. The peer is wrong there (§7.1 lists a
+zero-length payload as legal and §7.2.1 says a Sender *shall* send one; Tahoe both
+sends and accepts them) — but being right is not a reason to let a session thrash.
+
 **A NAK is not automatically a session problem.** `onNak` reads the echoed command
 header (§6.15) before reacting. A NAK of our Retransmit Request means only that the
 peer does not implement Retransmit; the generic "re‑invite" response would tear down
@@ -286,6 +300,17 @@ the overflow above cleanly, SIGABRT) rather than assuming your code is at fault.
 
 ## Status & roadmap
 
+**Bench-tested against macOS Tahoe** (2026‑09‑19, CoreMIDI's own Network MIDI 2.0,
+enabled in Audio MIDI Setup → MIDI Network Setup → "Network MIDI 2.0 Session 1").
+That is the first run against an independent, conformant implementation, and it found
+two defects the whole nine-suite run could not — see `tools/nm2_bench.cpp`, which is
+how to do it again. Build with `-DNETMIDI2_BUILD_TOOLS=ON`; `nm2_bench browse` lists
+peers, `nm2_bench client <host> <port> --probe` runs a full session using a UMP Stream
+Endpoint Discovery as the payload, which is silent and therefore safe against a live
+rig (`--note` is the audible opt-in). **Do not treat the other `_midi2._udp` boxes on
+that LAN as a reference** — they run older, unvetted builds of this very library, so
+agreeing with them proves nothing.
+
 **Phase 1 is done and interop‑tested** (against a real Teensy peer via the host):
 Invitation/Reply, Ping/Bye, NAK, bidirectional UMP Data, both roles, over an
 explicit `host:port`.
@@ -297,7 +322,8 @@ explicit `host:port`.
 | ~~Retransmit (`0x80`/`0x81`)~~ | **done** (shares the sent‑UMP history with FEC) |
 | ~~Authentication (`0x02`/`0x03`, `0x12`/`0x13`)~~ | **done** (`Auth.h`; SHA‑256 + entropy injected via `ICrypto`) |
 | ~~Session Reset (`0x82`/`0x83`)~~ | **done** |
-| Invitation Reply: Pending (`0x11`, §6.6) | the only unimplemented command — a Host stalling while it asks a user; needs UI, so it belongs to the consumer's design more than ours. Currently NAK `0x01`. |
+| ~~Invitation Reply: Pending (`0x11`, §6.6) — Client side~~ | **done.** Not optional after all: macOS Tahoe sends `0x11` on *every* connection. We wait, with a long budget, and stop repeating the Invitation. |
+| Invitation Reply: Pending (`0x11`) — **Host** side | still open, and still the consumer's call: *deciding* to stall while a user is asked is UI, not transport. `writeInvitationPending()` is there when they want it. |
 | ~~Spec Appendix A.1 conformance vectors as a unit test~~ | **done** (`tests/conformance_vectors.cpp`) |
 
 ## Reference material

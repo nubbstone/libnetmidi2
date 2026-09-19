@@ -82,6 +82,8 @@ struct Recorder : ISessionListener
         ++umpCount; lastWord0 = count ? words[0] : 0;
         printf ("  [%s] received UMP: %u word(s), word0=0x%08X\n", who, count, lastWord0);
     }
+    int pendingSeen = 0;
+    void onInvitationPending() override { ++pendingSeen; }
     void onStateChanged (State s) override
     {
         state = s;
@@ -1048,6 +1050,125 @@ int main()
         check (sender.sendUmp (note, 2), "idle: a second real UMP is sent");
         for (int i = 0; i < 400; ++i) { sender.tick(); drainWatcher(); usleep (500); }
         check (zeroLen > settled, "idle: fresh data re-arms the idle declarations");
+    }
+
+    // 7b. Invitation Reply: Pending (spec 6.6) -- a Host that needs time.
+    //
+    // Found on the bench, not by reading the spec: macOS Tahoe's CoreMIDI sends 0x11
+    // on EVERY connection, immediately before its Accepted. We answered NAK 0x01
+    // "command not supported". Tahoe ignored the NAK and sent the Accepted anyway,
+    // so the session opened and nothing looked wrong -- which is precisely why a
+    // loopback suite running our code against our own code could never catch it.
+    // Neither side ever sent a 0x11, so neither side ever had to handle one.
+    //
+    // Spec 6.6 specifies three arms, and we used to get all three wrong.
+    {
+        PosixUdp rawHost; std::uint16_t rawPort = 0;
+        rawHost.bind (0, rawPort);
+        Endpoint rawEp {}; std::strcpy (rawEp.address, "127.0.0.1"); rawEp.port = rawPort;
+
+        const char *pn = "Pending Host", *pp = "PENDING-HOST-1";
+        auto sendPending = [&] (const Endpoint& to) {
+            std::uint8_t b[128]; Writer w (b, sizeof b);
+            w.writeSignature();
+            writeInvitationPending (w, pn, std::strlen (pn), pp, std::strlen (pp));
+            rawHost.send (to, b, w.size());
+        };
+
+        // ARM 1 -- client with an invitation outstanding: "The Client shall wait."
+        PosixUdp cSock; std::uint16_t cPort = 0; cSock.bind (0, cPort);
+        Platform cPlat { &cSock, &clock, nullptr };
+        Recorder cRec ("pending-client");
+        Session pc (cPlat, Role::client, &cRec, "Pending Client", "PENDING-CLIENT-1");
+        pc.connect (rawEp);
+
+        Endpoint from {}; bool sawInvite = false;
+        for (int i = 0; i < 800 && ! sawInvite; ++i)
+        {
+            std::uint8_t in[512];
+            const int n = rawHost.receive (in, sizeof in, from);
+            if (n > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::invitation) sawInvite = true; });
+            pc.tick(); usleep (1000);
+        }
+        check (sawInvite, "pending: raw host saw the Invitation");
+        sendPending (from);
+
+        bool nakked = false;
+        for (int i = 0; i < 400; ++i)
+        {
+            std::uint8_t in[512]; Endpoint f2;
+            const int n = rawHost.receive (in, sizeof in, f2);
+            if (n > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::nak) nakked = true; });
+            pc.tick(); usleep (1000);
+        }
+        check (! nakked, "pending: a Pending reply earns no NAK (spec 6.6)");
+        check (pc.state() == State::inviting, "pending: ...and the client is still waiting");
+        check (cRec.pendingSeen == 1, "pending: the listener heard about it exactly once");
+
+        // The whole point of waiting: the eventual Accepted must still work.
+        {
+            std::uint8_t b[128]; Writer w (b, sizeof b); w.writeSignature();
+            writeInvitationAccepted (w, pn, std::strlen (pn), pp, std::strlen (pp));
+            rawHost.send (from, b, w.size());
+        }
+        for (int i = 0; i < 600 && pc.state() != State::established; ++i)
+        { pc.tick(); usleep (1000); }
+        check (pc.state() == State::established, "pending: the later Accepted still establishes");
+
+        // ARM 2 -- client with NO invitation outstanding: Bye 0x06.
+        PosixUdp iSock; std::uint16_t iPort = 0; iSock.bind (0, iPort);
+        Platform iPlat { &iSock, &clock, nullptr };
+        Recorder iRec ("idle-client");
+        Session idleClient (iPlat, Role::client, &iRec, "Idle Client", "IDLE-CLIENT-1");
+        Endpoint idleEp {}; std::strcpy (idleEp.address, "127.0.0.1"); idleEp.port = iPort;
+        sendPending (idleEp);
+
+        bool byeNoPending = false;
+        for (int i = 0; i < 400 && ! byeNoPending; ++i)
+        {
+            idleClient.tick();
+            std::uint8_t in[512]; Endpoint f3;
+            const int n = rawHost.receive (in, sizeof in, f3);
+            if (n > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::bye
+                        && std::uint8_t (c.cmdSpecific >> 8)
+                             == std::uint8_t (ByeReason::noPendingSession))
+                        byeNoPending = true; });
+            usleep (1000);
+        }
+        check (byeNoPending, "pending: no invitation outstanding -> Bye 0x06 (spec 6.6)");
+        check (idleClient.state() != State::established,
+               "pending: ...and it certainly did not open a session");
+
+        // ARM 3 -- a HOST receiving one: NAK 0x02, Command Not Expected.
+        PosixUdp hSock2; std::uint16_t hPort2 = 0; hSock2.bind (0, hPort2);
+        Platform hPlat2 { &hSock2, &clock, nullptr };
+        Recorder hRec2 ("pending-host");
+        Session host2 (hPlat2, Role::host, &hRec2, "Pending Host Side", "PENDING-HOST-2");
+        host2.listen();
+        Endpoint h2Ep {}; std::strcpy (h2Ep.address, "127.0.0.1"); h2Ep.port = hPort2;
+        sendPending (h2Ep);
+
+        bool nakNotExpected = false;
+        for (int i = 0; i < 400 && ! nakNotExpected; ++i)
+        {
+            host2.tick();
+            std::uint8_t in[512]; Endpoint f4;
+            const int n = rawHost.receive (in, sizeof in, f4);
+            if (n > 0)
+                parseDatagram (in, std::size_t (n), [&] (const ParsedCommand& c) {
+                    if (c.code == Command::nak
+                        && std::uint8_t (c.cmdSpecific >> 8)
+                             == std::uint8_t (NakReason::commandNotExpected))
+                        nakNotExpected = true; });
+            usleep (1000);
+        }
+        check (nakNotExpected, "pending: a Host answers 0x11 with NAK 0x02 (spec 6.6)");
     }
 
     // 8. Graceful close.
