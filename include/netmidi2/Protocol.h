@@ -253,6 +253,17 @@ inline bool writeInvitationAccepted (Writer& w,
                                   name, nameLen, productId, productLen);
 }
 
+/*  §6.6 Invitation Reply: Pending (Table 13) -- "the Host needs some time to
+    determine if it can accept the invitation". Same Endpoint Identity payload as
+    Accepted: the Host identifies itself while it decides. csd2 is reserved, 0. */
+inline bool writeInvitationPending (Writer& w,
+                                    const char* name, std::size_t nameLen,
+                                    const char* productId, std::size_t productLen) noexcept
+{
+    return writeEndpointIdentity (w, Command::invitationReplyPending, 0,
+                                  name, nameLen, productId, productLen);
+}
+
 inline bool writePing (Writer& w, std::uint32_t pingId) noexcept
 {
     return w.writeHeader (Command::ping, 1, 0) && w.u32 (pingId);

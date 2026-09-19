@@ -164,6 +164,38 @@ regression-tested (`dup-accept:`).
 An Accepted from an endpoint we never invited **must not establish anything**,
 however well-formed — otherwise any box on the LAN could hand us a session unasked.
 
+### 3.9 Invitation Reply: Pending — `0x11` (§6.6)  *(Host → Client)*
+
+Same Endpoint Identity payload as Accepted (Table 13: `csd1` = UMP Endpoint Name length
+in 32-bit words, `csd2` reserved 0, then the name and the Product Instance Id). The Host
+is saying "I have your invitation, I need a moment" — §6.6's own example is a Host
+asking a user for permission.
+
+Treat this as required reading, not an optional extra: **macOS Tahoe's CoreMIDI sends
+`0x11` before its Accepted on every single connection.** A Client that does not
+understand it answers a conformant Host with a protocol error on every handshake.
+
+Three arms, all normative:
+
+| Receiver | Response |
+|---|---|
+| Client with an invitation outstanding, *or* Established | **Wait.** No reply at all. |
+| Client in any other state | Bye `0x06` (No Pending Invitation) |
+| Host | NAK `0x02` (Command Not Expected) |
+
+"Wait" has a second half that is easy to miss: stop repeating the Invitation, and stop
+counting down to the §6.2 invite timeout on the old budget. Someone may be looking at a
+permission dialog, and ten seconds is not a fair allowance for a human. We restart the
+clock against `Timing::invitePendingTimeoutMs` (60s) and send no further Invitations —
+repeating at a Host that has already answered only pesters it while a user decides.
+
+`ISessionListener::onInvitationPending()` reports it, because a UI showing a short
+"connecting…" spinner will look broken when the handshake legitimately takes as long as
+a person takes to answer a dialog.
+
+We do **not** implement the Host side. Choosing to stall is a UI decision and belongs to
+the consumer; `writeInvitationPending()` is provided for when they want it.
+
 ### 3.4 Ping / Ping Reply — `0x20` / `0x21` (§6.13–6.14)
 
 ```
