@@ -194,6 +194,12 @@ cmake -S . -B build -DNETMIDI2_BUILD_TOOLS=ON && cmake --build build
 endpoint answers and that **cannot make a sound**, so it is safe to point at a live
 rig. `--note` is the audible opt‑in.
 
+## Documentation
+
+- **[`docs/tutorial.md`](docs/tutorial.md)** — a step-by-step guide: why the problem
+  exists, how to write the four adapters, how to deploy, and the half-dozen things
+  that reliably catch people out. **Start here if you are integrating the library.**
+
 ## Protocol reference
 
 - **[`PROTOCOL.md`](PROTOCOL.md)** — the wire contract this library implements: the
