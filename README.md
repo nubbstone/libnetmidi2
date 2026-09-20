@@ -1,36 +1,71 @@
 # libnetmidi2
 
 A small, portable, dependency‑free **C++17 implementation of Network MIDI 2.0
-(UDP)** — the MIDI Association's UMP‑over‑UDP transport, spec **M2‑124‑UM**.
+(UDP)** — the MIDI Association's UMP‑over‑UDP transport, spec **M2‑124‑UM v1.0**.
 
 ![CI](https://github.com/nubbstone/libnetmidi2/actions/workflows/ci.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Send and receive **MIDI 2.0 Universal MIDI Packets over Ethernet/Wi‑Fi** with full
-32‑bit resolution and per‑note expression — no operating‑system support required.
+32‑bit resolution and per‑note expression — on desktop, and on a microcontroller.
 
 ## Why
 
-Most platforms still ship **no** Network MIDI 2.0 transport. Apple's CoreMIDI, for
-example, only offers legacy **RTP‑MIDI (MIDI 1.0)**, which collapses everything to
-7‑bit. `libnetmidi2` implements the real thing — the MIDI Association's Network
-MIDI 2.0 (UDP) spec — in a form small enough to run on a desktop app *and* on a
-microcontroller.
+Network MIDI 2.0 is only just arriving in operating systems. **macOS 26 (Tahoe) is
+the first mainstream OS to ship it** — before that, Apple offered only legacy
+**RTP‑MIDI (MIDI 1.0)**, which collapses everything to 7 bits. Most other platforms,
+and every bare‑metal target, still have nothing.
+
+So this library exists to put the real transport wherever you need it:
+
+- **Platforms that have no implementation** — Windows, Linux, and embedded targets.
+- **Microcontrollers** — the core has no heap, no STL and no OS headers, so the same
+  code that runs in your desktop app runs on a Teensy or under Zephyr.
+- **macOS before 26**, where CoreMIDI's network transport is still MIDI 1.0 only.
+- **Control over the transport** — you own the socket, the timing and the buffers,
+  which matters when you are building a router or a synth rather than an app that
+  happens to speak MIDI.
+
+Where an OS *does* ship Network MIDI 2.0, this library talks to it. That is the
+point of being spec‑faithful rather than merely self‑consistent.
+
+## Interop
+
+Verified on the bench against independent implementations, not just against itself:
+
+| Peer | Result |
+|---|---|
+| **macOS 26 Tahoe — CoreMIDI Network MIDI 2.0** | Full handshake, Ping both ways, UMP Stream round trip, its FEC correctly deduplicated, clean Bye |
+| **Teensy 4.1 / Zephyr** (titou's `netmidi2.c`) | Full handshake, Ping, UMP Stream round trip, clean Bye |
+
+This matters more than the test count. The nine suites run our code against our own
+code, so a symmetric misreading of the spec passes all of them — and two did, until
+a real peer disagreed. [`tools/nm2_bench.cpp`](tools/nm2_bench.cpp) is the harness
+that found them, and how to repeat the exercise.
+
+Scope of that testing, stated plainly: one afternoon, one LAN. It does not cover
+sustained musical load, packet loss, Wi‑Fi, or authentication against a non‑Apple
+peer.
 
 ## Features
 
 - **Faithful to M2‑124‑UM** — 4‑byte `MIDI` signature, 32‑bit command header,
-  Invitation/Reply, Ping/Bye, NAK, UMP Data with sequence numbers. Interops with
-  any other spec‑compliant implementation.
+  Invitation/Reply, Ping/Bye, NAK, UMP Data with sequence numbers, and the §7.2
+  integrity machinery. Byte‑for‑byte conformance vectors from the spec's Appendix A.1.
 - **Both roles** — act as the UDP *Host* (listen/accept) or *Client* (discover/invite).
-- **Bidirectional** — send and receive UMP once a session is Established.
+- **Many clients, one port** — `HostPort` serves N sessions from a single UDP port,
+  as §3.2 requires of a Host.
+- **Robustness** — 64‑entry anti‑replay window, FEC send/receive (§7.2.2),
+  Retransmit (§7.2.3–7.2.4), Session Reset (§6.11–6.12), idle declarations (§7.2.1).
+- **Authentication** — shared‑secret and user/password (§6.7–6.10), with SHA‑256 and
+  entropy injected through `ICrypto` so you can use CommonCrypto, mbedTLS, or a
+  hardware engine. No crypto is implemented here.
 - **Freestanding‑friendly** — no exceptions, no RTTI, no heap, no STL containers,
-  no OS headers in the core. Safe for Zephyr / bare‑metal as well as desktop.
-- **Injected I/O** — the protocol core is OS‑agnostic; you supply the socket,
-  clock, and (optionally) mDNS. One codebase runs everywhere.
+  no OS headers in the core. CI enforces it.
+- **Injected I/O** — the protocol core is OS‑agnostic; you supply the socket, clock,
+  and optionally mDNS and crypto.
 - **Header‑only core** — drop the include dir into your build; no library to link.
-- **Tested** — a real‑UDP loopback test drives the full handshake + bidirectional
-  UMP + graceful close.
+- **Tested** — nine suites, 313 checks, plus the real‑peer bench above.
 
 ## Design: portable core + injected I/O
 
@@ -39,28 +74,33 @@ microcontroller.
              │  libnetmidi2 core  (portable, freestanding)  │
              │  Protocol.h  — wire format (build/parse)      │
              │  Session.h   — state machine, seq, ping, bye  │
+             │  HostPort.h  — one port, many sessions (§3.2) │
              └───────────────┬──────────────────────────────┘
-                             │ IUdpSocket · IClock · IDiscovery
+                             │ IUdpSocket · IClock · IDiscovery · ICrypto
               ┌──────────────┴───────────────┐
       Desktop (e.g. JUCE adapters)     Embedded (e.g. Zephyr adapters)
       DatagramSocket / Time /          BSD sockets / k_uptime /
       NetworkServiceDiscovery          mDNS responder
 ```
 
-Because every platform compiles the **same** `Protocol.h` and `Session.h`, framing
-is identical by construction — two peers built on this library interoperate with
-zero drift.
+Because every platform compiles the **same** `Protocol.h` and `Session.h`, framing is
+identical by construction — two peers built on this library cannot drift apart.
 
 ## Layout
 
 ```
 include/netmidi2/
   Protocol.h   wire format: signature, command codes, big-endian build/parse
-  Platform.h   injected I/O interfaces (IUdpSocket / IClock / IDiscovery)
-  Session.h    session state machine (Idle→Inviting→Established), seq/ping/bye
+  Platform.h   injected I/O interfaces (IUdpSocket / IClock / IDiscovery / ICrypto)
+  Session.h    session state machine, sequence numbers, ping/bye, FEC, retransmit
+  HostPort.h   one UDP port serving many Clients (§3.2)
+  Discovery.h  the mDNS/DNS-SD contract for _midi2._udp (§4) — no responder here
+  Auth.h       the §6.7–6.10 digest construction — no crypto here
 PROTOCOL.md    the wire contract — a readable profile of M2-124-UM
-tests/         session_loopback.cpp — Host+Client over real localhost UDP
-CMakeLists.txt target `netmidi2` + the loopback test
+UPGRADING.md   what consumers must change, and what is not yet proven
+tests/         nine suites: conformance vectors, protocol guards, loopback,
+               multi-client, discovery, FEC, retransmit, auth, session reset
+tools/         nm2_bench.cpp — interop harness for driving a real peer
 ```
 
 ## Integrate
@@ -72,12 +112,15 @@ add_subdirectory(libnetmidi2)            # or FetchContent / a submodule
 target_link_libraries(your_app PRIVATE netmidi2)
 ```
 
-Or just add `libnetmidi2/include` to your include path and `#include <netmidi2/Session.h>`.
+Or add `libnetmidi2/include` to your include path and `#include <netmidi2/Session.h>`.
+
+**Already using it?** Read [`UPGRADING.md`](UPGRADING.md) before you pull — it lists
+the API breaks and, more importantly, the behaviour that changed without one.
 
 ## Usage
 
-Implement the three platform interfaces for your OS (`IUdpSocket`, `IClock`, and —
-optionally, for mDNS discovery — `IDiscovery`), then drive a `Session`:
+Implement the platform interfaces for your OS (`IUdpSocket` and `IClock` are required;
+`IDiscovery` and `ICrypto` are optional), then drive a `Session`:
 
 ```cpp
 #include <netmidi2/Session.h>
@@ -88,6 +131,10 @@ struct MyListener : ISessionListener {
         // hand `words` (host-order UMP) to your synth / router
     }
     void onStateChanged (State s) override { /* update your UI */ }
+
+    // The host is asking a user whether to admit us (§6.6). This can take as long
+    // as a person takes to answer a dialog -- don't show a short spinner.
+    void onInvitationPending() override { /* "waiting for the other device..." */ }
 };
 
 MyUdpSocket socket;      // your IUdpSocket
@@ -114,47 +161,77 @@ for (;;) {                               // call frequently from your run loop
 ```
 
 A UDP *Host* is the same, but calls `session.listen()` instead of `connect()` and
-learns its peer from the incoming Invitation.
+learns its peer from the incoming Invitation. A Host that may face **more than one**
+Client needs `HostPort` rather than a second `Session` on a second port: §3.2 requires
+all Clients to be served from the one advertised port.
 
-See `tests/session_loopback.cpp` for a complete, runnable example (with POSIX socket
-and clock adapters) that stands up a Host and a Client and exchanges UMP.
+Two things worth knowing before you wire it in:
+
+- **`close()` is not synchronous.** It enters the spec's Pending Bye state and repeats
+  the Bye until the peer answers. Wait for `State::closed`.
+- **`State` has seven values**, including `authenticating`, `resetting` and `closing`.
+  A `switch` over it needs arms for those.
+
+See `tests/session_loopback.cpp` for a complete, runnable example with POSIX adapters.
 
 ## Build & test
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure     # runs the UDP loopback test
+ctest --test-dir build --output-on-failure     # all nine suites
 ```
+
+To build the interop harness and point it at a real device:
+
+```bash
+cmake -S . -B build -DNETMIDI2_BUILD_TOOLS=ON && cmake --build build
+./build/nm2_bench browse                       # list _midi2._udp peers on the LAN
+./build/nm2_bench client <host> <port> --probe # full session, prints every datagram
+```
+
+`--probe` sends a UMP Stream Endpoint Discovery: a legal UMP that a conformant
+endpoint answers and that **cannot make a sound**, so it is safe to point at a live
+rig. `--note` is the audible opt‑in.
 
 ## Protocol reference
 
 - **[`PROTOCOL.md`](PROTOCOL.md)** — the wire contract this library implements: the
   signature, command header, full command‑code table, UMP Data framing, session
-  lifecycle, and mDNS discovery. Start here if you're implementing the other end.
+  lifecycle, discovery, and the §7.2 integrity mechanisms. Start here if you're
+  implementing the other end.
 - MIDI Association **M2‑124‑UM** "Network MIDI 2.0 (UDP)" v1.0 — the normative spec.
 
 ## Status
 
-Phase 1 of the spec is implemented and interop‑tested: **Invitation / Reply,
-Ping / Bye, NAK, and bidirectional UMP Data** over an explicit `host:port`.
+The transport is feature‑complete against M2‑124‑UM, and interop‑tested against
+macOS Tahoe and a Zephyr peer.
 
 | Area | Status |
 |---|---|
-| Wire format (`Protocol.h`) | ✅ |
-| Session (Invitation → Established, Ping/Bye, sequence dedup) | ✅ |
-| Both roles (Host / Client), bidirectional UMP | ✅ + loopback test |
-| mDNS discovery (`_midi2._udp`) | planned |
-| FEC + retransmit robustness | planned |
-| Authentication (Invitation with Auth) | planned |
+| Wire format (`Protocol.h`), Appendix A.1 conformance vectors | ✅ |
+| Session lifecycle, sequence dedup, Ping/Bye/NAK | ✅ |
+| Both roles, bidirectional UMP | ✅ |
+| Several Clients on one Host port (`HostPort`, §3.2) | ✅ |
+| mDNS discovery contract (`_midi2._udp`, §4) | ✅ contract — the responder is an adapter |
+| FEC send + receive, Retransmit, idle declarations (§7.2) | ✅ |
+| Authentication, shared‑secret and user (§6.7–6.10) | ✅ — SHA‑256 injected via `ICrypto` |
+| Session Reset (§6.11–6.12) | ✅ |
+| Invitation Reply: Pending (`0x11`, §6.6) | ✅ Client side — we honour a Host that asks for time. Sending one is the app's call, so the Host side is left to you. |
+
+`IDiscovery` and `ICrypto` have no implementations in this repo, by design: an mDNS
+responder and a SHA‑256 are platform territory, and shipping one of each here would
+make hardware accelerators unreachable. See `Discovery.h` and `Auth.h` for the
+contracts, and `tests/` for working fakes.
 
 ## Contributing
 
-Issues and pull requests welcome. Please keep the **core** (`Protocol.h`,
-`Session.h`) freestanding — no exceptions/RTTI/heap/STL containers/OS headers — so
-it keeps compiling on embedded targets. Platform‑specific code belongs in adapters,
-behind the `Platform.h` interfaces. New wire behaviour should cite the M2‑124‑UM
-section it implements and, where practical, add a test.
+Issues and pull requests welcome. Please keep the **core** (`Protocol.h`, `Session.h`)
+freestanding — no exceptions/RTTI/heap/STL containers/OS headers — so it keeps
+compiling on embedded targets. Platform‑specific code belongs in adapters, behind the
+`Platform.h` interfaces. New wire behaviour should cite the M2‑124‑UM section it
+implements and, where practical, add a test. If you change public API, update
+`UPGRADING.md`.
 
 ## License
 
