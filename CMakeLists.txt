@@ -30,7 +30,9 @@ if(NETMIDI2_BUILD_TOOLS AND UNIX)
     add_executable(nm2_cli tools/nm2_cli.cpp)
     target_link_libraries(nm2_cli PRIVATE netmidi2)
     if(NOT APPLE)
-        find_path(DNSSD_INCLUDE_DIR dns_sd.h)
+        # Avahi's compat layer installs the header in its own subdirectory, not
+        # straight into /usr/include, so it needs the suffix hint to be found.
+        find_path(DNSSD_INCLUDE_DIR dns_sd.h PATH_SUFFIXES avahi-compat-libdns_sd)
         find_library(DNSSD_LIBRARY NAMES dns_sd)
         if(DNSSD_INCLUDE_DIR AND DNSSD_LIBRARY)
             target_include_directories(nm2_cli PRIVATE ${DNSSD_INCLUDE_DIR})

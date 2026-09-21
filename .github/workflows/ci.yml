@@ -27,6 +27,62 @@ jobs:
       - name: Test (conformance vectors + UDP loopback)
         run: ctest --test-dir build --build-config Release --output-on-failure
 
+  tools:
+    name: tools build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # nm2_cli carries an mDNS adapter over Bonjour. macOS has that in libSystem;
+      # on Linux it comes from Avahi's compatibility layer. Installing it means the
+      # real adapter is compiled on BOTH platforms -- otherwise Linux quietly takes
+      # the no-mDNS fallback path and the adapter is only ever built on one OS.
+      - name: Install Bonjour compatibility layer (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libavahi-compat-libdnssd-dev
+
+      - name: Configure with tools enabled
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNETMIDI2_BUILD_TOOLS=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      # Prove the Bonjour path was actually compiled in rather than silently falling
+      # back. A link-time symbol is the right check here: a runtime one would depend
+      # on a responder being alive on the runner, which is not something to make the
+      # build depend on.
+      - name: Confirm the mDNS adapter is present
+        run: |
+          if ! nm -u build/nm2_cli | grep -q DNSServiceBrowse; then
+            echo "nm2_cli was built WITHOUT the Bonjour adapter"
+            exit 1
+          fi
+          echo "Bonjour adapter linked in"
+
+      # These need a peer on the network to do anything real, so CI can only check
+      # that they start, parse arguments, and reject bad input. That still catches
+      # the failure that actually happens: a tool nobody noticed had stopped
+      # compiling, or one whose argument handling broke in a refactor.
+      - name: Smoke test
+        run: |
+          ./build/nm2_cli --help > /dev/null
+          echo "nm2_cli --help ok"
+
+          if ./build/nm2_bench > /dev/null 2>&1; then
+            echo "expected nm2_bench to exit non-zero when given no arguments"; exit 1
+          fi
+          echo "nm2_bench reports usage ok"
+
+          if ./build/nm2_cli --connect 127.0.0.1:1 --chord "not a chord" > /dev/null 2>&1; then
+            echo "expected a malformed --chord to be rejected"; exit 1
+          fi
+          echo "nm2_cli rejects bad input ok"
+
   freestanding:
     name: core compiles freestanding (no exceptions/RTTI)
     runs-on: ubuntu-latest
