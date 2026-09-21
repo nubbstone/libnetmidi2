@@ -96,16 +96,30 @@ using namespace netmidi2;
 
 ### Step 1: The socket adapter
 
-`IUdpSocket` is three methods. The only real requirement is that **`receive()` must
-not block** — it returns `0` when nothing is waiting.
+`IUdpSocket` is three methods. Two requirements matter more than they look:
+**`receive()` must not block**, and **the socket should be dual-stack**.
+
+That second one cost a real afternoon, so it is worth saying plainly before the code.
+A macOS host advertises its hostname over mDNS, and `<host>.local` resolves to *both*
+address families — with the **IPv6 records listed first**. A peer that dials you by
+name will therefore often arrive over IPv6, and an `AF_INET` socket never sees the
+Invitation. Not an error, not a rejected packet: nothing at all, while the other end
+reports that you did not answer. This was found by pointing macOS Tahoe's own client
+at an IPv4-only build of `nm2_cli`; its Invitation was going to
+`fe80::1c2d:3e4f:5a6b:7c8d%en0` and landing nowhere.
+
+So: one `AF_INET6` socket with `IPV6_V6ONLY` turned off, which receives both families.
 
 ```cpp
 #include <netmidi2/Session.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cstdio>
+#include <cstring>
 
 using namespace netmidi2;
 
@@ -115,62 +129,105 @@ struct PosixUdpSocket : IUdpSocket
 
     bool bind (std::uint16_t desiredPort, std::uint16_t& boundPortOut) override
     {
-        fd = ::socket (AF_INET, SOCK_DGRAM, 0);
-        if (fd < 0)
-            return false;
+        fd = ::socket (AF_INET6, SOCK_DGRAM, 0);
+        if (fd < 0) return false;
 
-        ::fcntl (fd, F_SETFL, O_NONBLOCK);          // non-blocking is mandatory
+        int off = 0;                                       // dual-stack: accept v4 too
+        ::setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+        ::fcntl (fd, F_SETFL, O_NONBLOCK);                 // non-blocking is mandatory
 
-        sockaddr_in addr {};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl (INADDR_ANY);  // not LOOPBACK -- peers are on the LAN
-        addr.sin_port        = htons (desiredPort); // 0 = let the OS choose
-
-        if (::bind (fd, (sockaddr*) &addr, sizeof addr) != 0)
-            return false;
+        sockaddr_in6 addr {};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr   = in6addr_any;                    // not loopback: peers are out there
+        addr.sin6_port   = htons (desiredPort);            // 0 = let the OS choose
+        if (::bind (fd, (sockaddr*) &addr, sizeof addr) != 0) return false;
 
         // Report the port we actually got: mDNS has to advertise the real number.
-        sockaddr_in actual {};
-        socklen_t   len = sizeof actual;
+        sockaddr_in6 actual {}; socklen_t len = sizeof actual;
         ::getsockname (fd, (sockaddr*) &actual, &len);
-        boundPortOut = ntohs (actual.sin_port);
+        boundPortOut = ntohs (actual.sin6_port);
         return true;
     }
 
     int send (const Endpoint& to, const std::uint8_t* data, std::size_t len) override
     {
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons (to.port);
-        if (::inet_pton (AF_INET, to.address, &addr.sin_addr) != 1)
-            return -1;
+        sockaddr_in6 addr {};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port   = htons (to.port);
+
+        if (std::strchr (to.address, ':') == nullptr)
+        {
+            in_addr v4 {};                                 // IPv4 literal -> ::ffff:a.b.c.d
+            if (::inet_pton (AF_INET, to.address, &v4) != 1) return -1;
+            addr.sin6_addr.s6_addr[10] = 0xFF;
+            addr.sin6_addr.s6_addr[11] = 0xFF;
+            std::memcpy (&addr.sin6_addr.s6_addr[12], &v4, 4);
+        }
+        else
+        {
+            // getaddrinfo, not inet_pton: only it parses the %scope that a
+            // link-local address carries, and link-local is what .local peers give.
+            addrinfo hints {};
+            hints.ai_family = AF_INET6; hints.ai_socktype = SOCK_DGRAM;
+            hints.ai_flags  = AI_NUMERICHOST;
+            addrinfo* res = nullptr;
+            if (::getaddrinfo (to.address, nullptr, &hints, &res) != 0 || res == nullptr)
+                return -1;
+            auto* r = (sockaddr_in6*) res->ai_addr;
+            addr.sin6_addr     = r->sin6_addr;
+            addr.sin6_scope_id = r->sin6_scope_id;
+            ::freeaddrinfo (res);
+        }
+
         return (int) ::sendto (fd, data, len, 0, (sockaddr*) &addr, sizeof addr);
     }
 
     int receive (std::uint8_t* buffer, std::size_t capacity, Endpoint& from) override
     {
-        sockaddr_in addr {};
-        socklen_t   len = sizeof addr;
-        const ssize_t n = ::recvfrom (fd, buffer, capacity, 0, (sockaddr*) &addr, &len);
+        sockaddr_storage ss {}; socklen_t sl = sizeof ss;
+        const ssize_t n = ::recvfrom (fd, buffer, capacity, 0, (sockaddr*) &ss, &sl);
+        if (n < 0) return 0;               // EWOULDBLOCK -- nothing pending, NOT an error
 
-        if (n < 0)
-            return 0;      // EWOULDBLOCK -- nothing pending, NOT an error
-
-        ::inet_ntop (AF_INET, &addr.sin_addr, from.address, sizeof from.address);
-        from.port = ntohs (addr.sin_port);
+        auto* a6 = (sockaddr_in6*) &ss;
+        if (IN6_IS_ADDR_V4MAPPED (&a6->sin6_addr))
+        {
+            // Normalise ::ffff:a.b.c.d back to dotted quad. Endpoint identity is a
+            // string comparison, so the same peer must always spell the same way.
+            in_addr v4 {};
+            std::memcpy (&v4, &a6->sin6_addr.s6_addr[12], 4);
+            ::inet_ntop (AF_INET, &v4, from.address, sizeof from.address);
+        }
+        else
+        {
+            ::inet_ntop (AF_INET6, &a6->sin6_addr, from.address, sizeof from.address);
+            if (a6->sin6_scope_id != 0)                    // link-local needs its interface
+            {
+                char scope[16];
+                std::snprintf (scope, sizeof scope, "%%%u", a6->sin6_scope_id);
+                if (std::strlen (from.address) + std::strlen (scope) < sizeof from.address)
+                    std::strcat (from.address, scope);
+            }
+        }
+        from.port = ntohs (a6->sin6_port);
         return (int) n;
     }
 };
 ```
 
-Three things that will bite you if you skip them:
+Four things that will bite you if you skip them:
 
-1. **Bind `INADDR_ANY`, not `INADDR_LOOPBACK`**, unless you only ever want to talk to
-   yourself.
-2. **Return `0`, not `-1`, when there's nothing to read.** `-1` means a real error.
-   Getting this backwards makes the library think the socket is broken.
-3. **Report the *actual* bound port.** If you pass `0` to get an ephemeral port and
-   then advertise `0` over mDNS, nobody can reach you.
+1. **Dual-stack, as above.** The failure mode is silence, which is the hardest kind to
+   debug — you will be looking at your session code when the packet never arrived.
+2. **Normalise v4-mapped addresses back to dotted quad.** The library identifies a peer
+   by the address *string*, so `203.0.113.5` and `::ffff:203.0.113.5` must not be
+   allowed to look like two different devices.
+3. **Return `0`, not `-1`, when there is nothing to read.** `-1` means a real error.
+   Backwards, and the library concludes the socket is broken.
+4. **Report the *actual* bound port.** Pass `0` for an ephemeral port, advertise `0`
+   over mDNS, and nobody can reach you.
+
+If you genuinely only ever talk to fixed IPv4 addresses, an `AF_INET` socket is fifteen
+lines and works fine. The moment discovery is involved, use the one above.
 
 ### Step 2: The clock
 
@@ -532,7 +589,188 @@ implementation.
 
 ---
 
-## Part 4: Things that will catch you out
+## Part 4: A worked example — talking to macOS Tahoe
+
+Everything so far has been pieces. This part runs the whole thing against a real,
+independent implementation: **macOS 26 (Tahoe)**, whose CoreMIDI ships its own Network
+MIDI 2.0. Nothing here is illustrative — every log below is copied from a real run.
+
+The tool doing the talking is [`tools/nm2_cli.cpp`](../tools/nm2_cli.cpp), a complete
+endpoint built on this library: it advertises over mDNS, accepts several clients on one
+port, dials out, and plays an arpeggiated chord. It is the most complete worked example
+in the repo, and it is worth reading alongside this section.
+
+### Step 1: Turn on the macOS side
+
+Open **Audio MIDI Setup**, then **MIDI Studio → Open MIDI Network Setup…** (it is in the
+`MIDI Studio` menu, not the `Window` menu, when no network window is open yet).
+
+<!-- SCREENSHOT: audio-midi-setup-network-panel.png -->
+
+In **My Sessions**, select or create a session, then set:
+
+| Field | What it is |
+|---|---|
+| **Enabled** | The switch. Off by default — nothing is advertised until you turn it on. |
+| **Local Name** | The session's name inside Audio MIDI Setup. Local only. |
+| **Network Name** | What other devices see: this becomes the `UMPEndpointName` TXT field. |
+| **Port** | Shows `0` until enabled, then the real port it bound — note it down. |
+
+The **Endpoint Information** block below fills in once enabled, showing the
+`Product Instance Id` macOS generated for itself (`apple_` plus a hex string).
+
+<!-- SCREENSHOT: audio-midi-setup-enabled.png -->
+
+Two things that will confuse you if nobody says them:
+
+- **The session does not survive a restart in the enabled state.** The configuration is
+  remembered — name, port — but `Enabled` comes back off. If your peer suddenly cannot
+  find the Mac, check the switch before you debug anything else.
+- **Port `0` means "not yet bound"**, not "any port". It shows the real number only
+  after you enable it.
+
+Confirm it from the shell before going further — if it is not here, it is not on the
+network:
+
+```console
+$ dns-sd -Z _midi2._udp local
+_midi2._udp                          PTR   Jason’s\032MacBook\032Pro\032(2)._midi2._udp
+Jason’s\032MacBook\032Pro\032(2)._midi2._udp  SRV   0 0 5006 studiomac.local.
+Jason’s\032MacBook\032Pro\032(2)._midi2._udp  TXT   "UMPEndpointName=Jason’s MacBook Pro (2)"
+                                                  "ProductInstanceId=apple_3ddcb748…"
+```
+
+### Step 2: Dial it
+
+```console
+$ nm2_cli --connect 127.0.0.1:5006 --name "nm2_cli bench" --pid "NM2CLI-BENCH-1" --silent -v
+
+=== nm2_cli ===
+endpoint   : "nm2_cli bench"  pid "NM2CLI-BENCH-1"
+client     : inviting 127.0.0.1:5006 -> 127.0.0.1:5006 from :58419
+    [clnt] TX -> 127.0.0.1:5006 40 bytes  cmd 0x01
+  [client] state -> inviting
+
+    [clnt] RX <- 127.0.0.1:5006 80 bytes  cmd 0x11
+  [client] host is deciding (maybe asking a user) -- waiting
+    [clnt] RX <- 127.0.0.1:5006 80 bytes  cmd 0x10
+  [client] state -> established
+
+--- stopping ---
+    [clnt] TX -> 127.0.0.1:5006 8 bytes  cmd 0xF0
+  [client] state -> closing
+    [clnt] RX <- 127.0.0.1:5006 8 bytes  cmd 0xF1
+  [client] state -> closed
+```
+
+Read the middle of that carefully, because it is the whole of §6.6 in four lines.
+We send an Invitation (`0x01`). macOS answers **`0x11`, Invitation Reply: Pending** —
+"I need a moment" — and only then `0x10`, Accepted. **Tahoe does this on every single
+connection.** A client that treats `0x11` as an unsupported command answers a
+conformant host with a protocol error on every handshake. This library used to, and it
+was only ever found by running against macOS.
+
+The close is the other half worth noticing: `0xF0` Bye out, `0xF1` Bye Reply back,
+*then* `closed`. `close()` did not return with the session already shut.
+
+### Step 3: Find it by name instead
+
+The address works, but discovery is the point. `--connect` also takes a name, matched
+against the `UMPEndpointName` or `ProductInstanceId` from the TXT record:
+
+```console
+$ nm2_cli --connect "Jason’s MacBook Pro (2)" --name "nm2_cli bench" --pid "NM2CLI-BENCH-1"
+
+  mDNS: browsing _midi2._udp
+client     : browsing for a device named "Jason’s MacBook Pro (2)" from :59009
+  found: "m2-rtr-d" (MIDI2-ROUTERD-1) at 127.0.0.1:5004
+  found: "m2-rtr-d-2" (MIDI2-ROUTERD-1) at 127.0.0.1:5005
+  found: "Jason’s MacBook Pro (2)" (apple_3ddcb748…) at 127.0.0.1:5006
+  -> matches "Jason’s MacBook Pro (2)", inviting
+  [client] state -> established
+```
+
+Note the apostrophe survived. That is a U+2019 right single quote in a UTF-8 TXT
+record, round-tripped through Bonjour and compared byte-for-byte — which is why
+`isValidUmpEndpointName` counts **bytes, not characters**.
+
+### Step 4: The other direction, and the trap in it
+
+Now let macOS dial *us*. Start a host that advertises itself:
+
+```console
+$ nm2_cli --listen 5020 --clients 2 --name "nm2_cli Host" --pid "NM2CLI-HOST-1" \
+          --chord C3:min --bpm 90 -v
+
+host       : listening on :5020, 2 client slot(s)
+  mDNS: advertising "NM2CLI-HOST-1" on port 5020
+```
+
+It appears in Audio MIDI Setup under **Sessions and Directories**, by its
+`UMPEndpointName`. Select it and click **Connect**.
+
+<!-- SCREENSHOT: audio-midi-setup-sessions-list.png -->
+
+The first time this was tried, it failed — and the failure is worth more than the
+success. macOS reported that the device *"didn't respond to the connection request"*,
+while our host logged **nothing at all**. No bad packet, no rejection: silence.
+
+The cause is in Step 1 of Part 2. `studiomac.local` resolves to **both** address families,
+with the IPv6 records **first**:
+
+```console
+$ dns-sd -G v4v6 studiomac.local
+studiomac.local.   FE80:0000:0000:0000:1C2D:3E4F:5A6B:7C8D%en0
+studiomac.local.   127.0.0.1
+studiomac.local.   203.0.113.15
+```
+
+macOS dialled the link-local IPv6 address. The host socket was `AF_INET`. The
+Invitation went somewhere the socket could not hear, and neither end had anything
+useful to report. With the dual-stack socket from Part 2, the same click gives:
+
+```console
+    [host] RX <- fe80::1c2d:3e4f:5a6b:7c8d%14:5006 80 bytes  cmd 0x01
+    [host] TX -> fe80::1c2d:3e4f:5a6b:7c8d%14:5006 36 bytes  cmd 0x10
+  [host0] state -> established
+
+--- playing: 3 note(s), 1 octave(s), 90 bpm, MIDI 2.0 UMP ---
+    [host] TX -> fe80::1c2d:3e4f:5a6b:7c8d%14:5006 16 bytes  cmd 0xFF
+  note on   48 -> 1 peer(s)
+```
+
+Note the `%14` on the address. That is the interface scope on a link-local address, and
+it is why the send path uses `getaddrinfo` with `AI_NUMERICHOST` rather than
+`inet_pton` — `inet_pton` cannot parse a scope, so without it every reply would have
+failed to send.
+
+### Step 5: Prove it actually arrived
+
+A clean protocol trace only proves the packets were accepted. The claim worth checking
+is the one the whole library exists for: **that 32-bit resolution survives**.
+
+macOS exposes the session as a CoreMIDI source named `UMP Network <session name>`.
+Listening to it with a 12-line CoreMIDI client, while `nm2_cli` plays a C major triad:
+
+```console
+listening to source: UMP Network Network MIDI 2.0 Session 1
+  note ON    60  velocity 49152 / 65535  (mt=0x4 MIDI 2.0)
+  note OFF   60
+  note ON    64  velocity 49152 / 65535  (mt=0x4 MIDI 2.0)
+  note OFF   64
+  note ON    67  velocity 49152 / 65535  (mt=0x4 MIDI 2.0)
+
+totals: 24 note-on, 24 note-off, 0 other
+```
+
+`velocity 49152 / 65535`, and `mt=0x4` — MIDI 2.0 Channel Voice. That is the exact value
+`nm2_cli` sent, arriving in CoreMIDI with all sixteen bits intact. Through RTP-MIDI the
+same note would have been squashed to `96 / 127`.
+
+24 note-ons and 24 note-offs, perfectly balanced: nothing stuck, including the note that
+was sounding when Ctrl-C arrived.
+
+## Part 5: Things that will catch you out
 
 These are the ones that cost real debugging time.
 

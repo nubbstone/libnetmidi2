@@ -277,6 +277,18 @@ peer does not implement Retransmit; the generic "re‑invite" response would tea
 a healthy session for asking a question. Any new command we send needs the same
 thought before it inherits the default.
 
+**Adapters must be dual-stack, and the failure is silent.** A macOS Host advertises
+its hostname, `<host>.local` resolves to BOTH families with the **IPv6 records first**,
+and a peer dialling by name arrives over IPv6 — often a link-local `fe80::…%en0`. An
+`AF_INET` socket never sees the Invitation: no error, no packet, just a peer reporting
+that we did not answer. Found by letting Tahoe's own client dial an IPv4-only
+`nm2_cli`. Both tools now bind `AF_INET6` with `IPV6_V6ONLY` off and normalise
+`::ffff:a.b.c.d` back to dotted quad — Endpoint identity is a *string* compare, so the
+same peer must always spell the same way. The send path needs `getaddrinfo` with
+`AI_NUMERICHOST`, not `inet_pton`, because only it parses the `%scope` a link-local
+address carries. The loopback tests pass either way, which is exactly why this
+survived nine suites.
+
 **Discovery is a contract here, not an implementation.** `Discovery.h` has no mDNS
 responder and must not grow one — multicast, record encoding and a TTL cache are
 adapter territory (prime directives 1 and 3). What *does* belong here is anything the

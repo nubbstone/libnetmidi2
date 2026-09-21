@@ -52,41 +52,119 @@ struct BenchUdp : IUdpSocket
     int fd = -1;
     unsigned long long txDatagrams = 0, rxDatagrams = 0;
 
+    /*  Dual-stack, and that is not a nicety.
+        A macOS Host advertises its hostname over mDNS, and `<host>.local` resolves to
+        BOTH families -- with the IPv6 records listed first. A peer that dials us by
+        name therefore tends to arrive over IPv6, and an AF_INET socket simply never
+        sees the Invitation: no error, no packet, just a peer reporting that we did
+        not answer. This was found exactly that way, with macOS Tahoe's own client
+        timing out against an IPv4-only build of this tool.
+
+        So: one AF_INET6 socket with IPV6_V6ONLY off, which receives both families.
+        IPv4 peers arrive as ::ffff:a.b.c.d and are normalised back to dotted quad, so
+        that the address string the Session stores still compares equal to the one a
+        user typed -- Endpoint identity is a string comparison, and "203.0.113.5" and
+        "::ffff:203.0.113.5" are the same peer wearing two hats. */
     bool bind (std::uint16_t desiredPort, std::uint16_t& boundPortOut) override
     {
-        fd = ::socket (AF_INET, SOCK_DGRAM, 0);
-        if (fd < 0) return false;
-        ::fcntl (fd, F_SETFL, O_NONBLOCK);
+        fd = ::socket (AF_INET6, SOCK_DGRAM, 0);
+        if (fd < 0)
+            return false;
+
+        int off = 0;
+        ::setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
         int yes = 1; ::setsockopt (fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        ::fcntl (fd, F_SETFL, O_NONBLOCK);
 
-        sockaddr_in a {}; a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl (INADDR_ANY);
-        a.sin_port = htons (desiredPort);
-        if (::bind (fd, (sockaddr*) &a, sizeof a) != 0) return false;
+        sockaddr_in6 a {};
+        a.sin6_family = AF_INET6;
+        a.sin6_addr   = in6addr_any;
+        a.sin6_port   = htons (desiredPort);
+        if (::bind (fd, (sockaddr*) &a, sizeof a) != 0)
+            return false;
 
-        sockaddr_in got {}; socklen_t gl = sizeof got;
+        sockaddr_in6 got {}; socklen_t gl = sizeof got;
         ::getsockname (fd, (sockaddr*) &got, &gl);
-        boundPortOut = ntohs (got.sin_port);
+        boundPortOut = ntohs (got.sin6_port);
         return true;
     }
 
-    int send (const Endpoint& to, const std::uint8_t* data, std::size_t len) override
+    int send (const Endpoint& to, const std::uint8_t* d, std::size_t len) override
     {
-        sockaddr_in a {}; a.sin_family = AF_INET; a.sin_port = htons (to.port);
-        if (::inet_pton (AF_INET, to.address, &a.sin_addr) != 1) return -1;
-        const int n = (int) ::sendto (fd, data, len, 0, (sockaddr*) &a, sizeof a);
-        if (n > 0) { ++txDatagrams; dump ("TX ->", to, data, len); }
+        sockaddr_in6 a {};
+        a.sin6_family = AF_INET6;
+        a.sin6_port   = htons (to.port);
+
+        if (std::strchr (to.address, ':') == nullptr)
+        {
+            // IPv4 literal -> ::ffff:a.b.c.d so it can go out of the v6 socket.
+            in_addr v4 {};
+            if (::inet_pton (AF_INET, to.address, &v4) != 1) return -1;
+            a.sin6_addr.s6_addr[10] = 0xFF;
+            a.sin6_addr.s6_addr[11] = 0xFF;
+            std::memcpy (&a.sin6_addr.s6_addr[12], &v4, 4);
+        }
+        else
+        {
+            /*  A literal v6 address, possibly carrying a %scope for a link-local one.
+                getaddrinfo with AI_NUMERICHOST parses the scope; inet_pton cannot,
+                and link-local is exactly what a .local peer on the LAN gives us. */
+            addrinfo hints {};
+            hints.ai_family   = AF_INET6;
+            hints.ai_socktype = SOCK_DGRAM;
+            hints.ai_flags    = AI_NUMERICHOST;
+            addrinfo* res = nullptr;
+            if (::getaddrinfo (to.address, nullptr, &hints, &res) != 0 || res == nullptr)
+                return -1;
+            auto* r = (sockaddr_in6*) res->ai_addr;
+            a.sin6_addr     = r->sin6_addr;
+            a.sin6_scope_id = r->sin6_scope_id;
+            ::freeaddrinfo (res);
+        }
+
+        const int n = (int) ::sendto (fd, d, len, 0, (sockaddr*) &a, sizeof a);
+        if (n > 0) { ++txDatagrams; dump ("TX ->", to, d, len); }
         return n;
     }
 
-    int receive (std::uint8_t* buffer, std::size_t capacity, Endpoint& from) override
+    int receive (std::uint8_t* buf, std::size_t cap, Endpoint& from) override
     {
-        sockaddr_in a {}; socklen_t al = sizeof a;
-        const ssize_t n = ::recvfrom (fd, buffer, capacity, 0, (sockaddr*) &a, &al);
-        if (n < 0) return 0;
-        ::inet_ntop (AF_INET, &a.sin_addr, from.address, sizeof from.address);
-        from.port = ntohs (a.sin_port);
-        ++rxDatagrams; dump ("RX <-", from, buffer, (std::size_t) n);
+        sockaddr_storage ss {}; socklen_t sl = sizeof ss;
+        const ssize_t n = ::recvfrom (fd, buf, cap, 0, (sockaddr*) &ss, &sl);
+        if (n < 0) return 0;                       // nothing pending, not an error
+
+        if (ss.ss_family == AF_INET6)
+        {
+            auto* a6 = (sockaddr_in6*) &ss;
+            if (IN6_IS_ADDR_V4MAPPED (&a6->sin6_addr))
+            {
+                in_addr v4 {};
+                std::memcpy (&v4, &a6->sin6_addr.s6_addr[12], 4);
+                ::inet_ntop (AF_INET, &v4, from.address, sizeof from.address);
+            }
+            else
+            {
+                ::inet_ntop (AF_INET6, &a6->sin6_addr, from.address, sizeof from.address);
+                if (a6->sin6_scope_id != 0)        // link-local needs its interface
+                {
+                    char scope[16];
+                    std::snprintf (scope, sizeof scope, "%%%u", a6->sin6_scope_id);
+                    const std::size_t have = std::strlen (from.address);
+                    if (have + std::strlen (scope) < sizeof from.address)
+                        std::strcat (from.address, scope);
+                }
+            }
+            from.port = ntohs (a6->sin6_port);
+        }
+        else
+        {
+            auto* a4 = (sockaddr_in*) &ss;
+            ::inet_ntop (AF_INET, &a4->sin_addr, from.address, sizeof from.address);
+            from.port = ntohs (a4->sin_port);
+        }
+
+        ++rxDatagrams;
+        dump ("RX <-", from, buf, (std::size_t) n);
         return (int) n;
     }
 
