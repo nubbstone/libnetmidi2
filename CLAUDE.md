@@ -101,6 +101,11 @@ tests/             conformance_vectors.cpp — byte-exact vs spec Appendix A.1 (
 tools/             nm2_bench.cpp — interop harness: drives a real Session against a
                    real peer and prints every datagram. The only thing that can catch
                    what our own code and our own tests already agree about.
+                   nm2_cli.cpp   — a complete endpoint (mDNS advertise + browse,
+                   HostPort, client, arpeggiator). Contains the only real IDiscovery
+                   adapter in the repo, over Bonjour — keep it in tools/, not the
+                   core, and note it cannot set the §4.6 TTL through
+                   DNSServiceRegister.
 CMakeLists.txt     INTERFACE target `netmidi2` + all nine tests (add_test)
 README.md          public front page
 .github/workflows/ci.yml   build+ctest (ubuntu/macos) + freestanding compile check

@@ -389,6 +389,14 @@ If you'd rather not write a responder at all, you don't have to: leave `discover
 `nullptr` and connect to an explicit `host:port`. Plenty of real deployments have
 fixed addresses.
 
+**A working one to crib from:** `tools/nm2_cli.cpp` contains a complete Bonjour
+adapter — register with TXT records, browse, resolve, and a non-blocking `poll()`
+that services the Bonjour file descriptors with a zero-timeout `select`. It's about
+150 lines, which is a fair estimate of what Avahi or a Zephyr responder will cost you.
+It also documents the one thing it *can't* do: `DNSServiceRegister` gives no control
+over the record TTL, so it cannot honour §4.6's one-minute ceiling. If that matters
+to you, drive `DNSServiceRegisterRecord` instead.
+
 ### Step 8: Authentication (optional)
 
 If you want a shared secret on the session, supply an `ICrypto`. On macOS:
@@ -497,6 +505,17 @@ cmake -S . -B build -DNETMIDI2_BUILD_TOOLS=ON && cmake --build build
 ./build/nm2_bench browse                        # what's on the network?
 ./build/nm2_bench client 203.0.113.50 5004 --probe
 ```
+
+There's a second tool, `nm2_cli`, which is a complete endpoint rather than a probe —
+useful once you want something to talk *to* while developing your own end:
+
+```bash
+./build/nm2_cli --listen 5004 --name "Test Host" --pid "TEST-0001"   # a peer to dial
+./build/nm2_cli --connect "Test Host" --chord C4:maj7 --bpm 96       # something playing
+```
+
+It is also the most complete worked example in the repo: mDNS, `HostPort`, a client
+session and clean shutdown, in one readable file.
 
 `--probe` sends a UMP Stream Endpoint Discovery message: legal UMP that a conformant
 endpoint replies to, and which **cannot make a sound**. That matters when the device

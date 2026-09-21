@@ -101,6 +101,9 @@ UPGRADING.md   what consumers must change, and what is not yet proven
 tests/         nine suites: conformance vectors, protocol guards, loopback,
                multi-client, discovery, FEC, retransmit, auth, session reset
 tools/         nm2_bench.cpp — interop harness for driving a real peer
+               nm2_cli.cpp   — a complete endpoint: mDNS, multi-client host,
+                               client, and an arpeggiator. Includes a working
+                               Bonjour IDiscovery adapter.
 ```
 
 ## Integrate
@@ -194,9 +197,23 @@ cmake -S . -B build -DNETMIDI2_BUILD_TOOLS=ON && cmake --build build
 endpoint answers and that **cannot make a sound**, so it is safe to point at a live
 rig. `--note` is the audible opt‑in.
 
+The same option builds **`nm2_cli`**, a complete endpoint rather than a diagnostic —
+it advertises over mDNS, accepts several clients on one port, dials out to another
+device by name or address, and plays an arpeggiated chord down the session:
+
+```bash
+./build/nm2_cli --listen 5004 --name "My Synth" --pid "SYNTH-0001"
+./build/nm2_cli --connect "My Synth" --chord C4:maj7 --bpm 96
+./build/nm2_cli --listen --connect 203.0.113.50:5004      # both roles at once (§8)
+```
+
+It carries a working **Bonjour `IDiscovery` adapter** (~150 lines), which is the one
+adapter this library deliberately doesn't ship. Worth reading if you're writing your
+own for Avahi or Zephyr.
+
 ## Documentation
 
-- **[`docs/tutorial.md`](docs/tutorial.md)** — a step-by-step guide: why the problem
+- **[`docs/libnetmidi2 tutorial.md`](docs/libnetmidi2%20tutorial.md)** — a step-by-step guide: why the problem
   exists, how to write the four adapters, how to deploy, and the half-dozen things
   that reliably catch people out. **Start here if you are integrating the library.**
 

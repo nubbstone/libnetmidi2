@@ -19,10 +19,27 @@ target_compile_features(netmidi2 INTERFACE cxx_std_17)
 
 # Interop bench harness. Not a test -- it needs a real peer on the network -- but
 # the thing that found the defects the tests could not, so it ships with the library.
-option(NETMIDI2_BUILD_TOOLS "Build the nm2_bench interop harness" OFF)
+option(NETMIDI2_BUILD_TOOLS "Build the nm2_bench / nm2_cli tools" OFF)
 if(NETMIDI2_BUILD_TOOLS AND UNIX)
     add_executable(nm2_bench tools/nm2_bench.cpp)
     target_link_libraries(nm2_bench PRIVATE netmidi2)
+
+    # nm2_cli additionally carries a real mDNS adapter, over Bonjour. macOS has it
+    # in libSystem; elsewhere it needs Avahi's Bonjour compatibility layer. Without
+    # it the tool still builds and works, just with explicit host:port only.
+    add_executable(nm2_cli tools/nm2_cli.cpp)
+    target_link_libraries(nm2_cli PRIVATE netmidi2)
+    if(NOT APPLE)
+        find_path(DNSSD_INCLUDE_DIR dns_sd.h)
+        find_library(DNSSD_LIBRARY NAMES dns_sd)
+        if(DNSSD_INCLUDE_DIR AND DNSSD_LIBRARY)
+            target_include_directories(nm2_cli PRIVATE ${DNSSD_INCLUDE_DIR})
+            target_link_libraries(nm2_cli PRIVATE ${DNSSD_LIBRARY})
+            target_compile_definitions(nm2_cli PRIVATE HAVE_DNS_SD=1)
+        else()
+            message(STATUS "nm2_cli: no dns_sd found -- building without mDNS")
+        endif()
+    endif()
 endif()
 
 if(NOT NETMIDI2_SKIP_TESTS)
