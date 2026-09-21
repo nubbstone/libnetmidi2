@@ -605,8 +605,6 @@ in the repo, and it is worth reading alongside this section.
 Open **Audio MIDI Setup**, then **MIDI Studio → Open MIDI Network Setup…** (it is in the
 `MIDI Studio` menu, not the `Window` menu, when no network window is open yet).
 
-<!-- SCREENSHOT: audio-midi-setup-network-panel.png -->
-
 In **My Sessions**, select or create a session, then set:
 
 | Field | What it is |
@@ -619,7 +617,7 @@ In **My Sessions**, select or create a session, then set:
 The **Endpoint Information** block below fills in once enabled, showing the
 `Product Instance Id` macOS generated for itself (`apple_` plus a hex string).
 
-<!-- SCREENSHOT: audio-midi-setup-enabled.png -->
+![Audio MIDI Setup's MIDI Network Setup window, session enabled on port 5006](images/audio-midi-setup-enabled.png)
 
 Two things that will confuse you if nobody says them:
 
@@ -709,7 +707,7 @@ host       : listening on :5020, 2 client slot(s)
 It appears in Audio MIDI Setup under **Sessions and Directories**, by its
 `UMPEndpointName`. Select it and click **Connect**.
 
-<!-- SCREENSHOT: audio-midi-setup-sessions-list.png -->
+![Sessions and Directories listing nm2_cli Host, discovered over mDNS](images/audio-midi-setup-sessions-list.png)
 
 The first time this was tried, it failed — and the failure is worth more than the
 success. macOS reported that the device *"didn't respond to the connection request"*,
@@ -769,6 +767,27 @@ same note would have been squashed to `96 / 127`.
 
 24 note-ons and 24 note-offs, perfectly balanced: nothing stuck, including the note that
 was sounding when Ctrl-C arrived.
+
+### Step 6: To a DAW, it is just a MIDI device
+
+This is the part that makes the whole exercise worth it. Once the macOS session is
+enabled, the network endpoint is an ordinary CoreMIDI device — so any DAW picks it up
+with no knowledge of Network MIDI 2.0 at all. Here it is in Bitwig Studio's
+**Settings → Controllers**:
+
+![Bitwig Studio's Controllers settings: the network session listed as "Generic UMP Network Network MIDI 2.0 Session 1" among ordinary USB and Bluetooth controllers](images/bitwig-controllers.png)
+
+It arrives as **`Generic UMP Network Network MIDI 2.0 Session 1`**, sitting in the same
+list as a USB keyboard, a Bluetooth controller and a plug-in host — no special
+treatment, no plug-in, no driver.
+
+Nothing in Bitwig knows there is a UDP session, a sequence number or an Invitation
+handshake behind that entry. That is the correct outcome: your device appears as a MIDI
+device, and the transport disappears.
+
+It also means the quickest end-to-end test of your own implementation needs no code at
+all — enable the macOS session, point your device at it, and watch for the notes in
+whatever DAW you already have open.
 
 ## Part 5: Things that will catch you out
 
