@@ -27,6 +27,14 @@ jobs:
       - name: Test (conformance vectors + UDP loopback)
         run: ctest --test-dir build --build-config Release --output-on-failure
 
+      # The README tabulates what each suite is worth, per-suite check counts
+      # included. A stale count there is worse than no table, and nothing else here
+      # would catch it -- the suites would still pass while the README misreported
+      # them. Linux only: it re-runs the binaries, and once is enough.
+      - name: README test table is not stale
+        if: runner.os == 'Linux'
+        run: ./tests/check_readme_counts.sh
+
   tools:
     name: tools build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
