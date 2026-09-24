@@ -47,6 +47,36 @@ Scope of that testing, stated plainly: one afternoon, one LAN. It does not cover
 sustained musical load, packet loss, Wi‑Fi, or authentication against a non‑Apple
 peer.
 
+## Tests: what each one is worth
+
+313 checks across nine suites, all passing. The count on its own is close to
+meaningless, so here is what each suite actually establishes — and, more usefully,
+what it structurally cannot.
+
+| Suite | Checks | What it proves | What it cannot |
+|---|---:|---|---|
+| `conformance_vectors` | 25 | Byte‑exact framing against the spec's own Appendix A.1 figures, in both directions. The only suite that can catch a wire‑format error. | Anything time‑dependent — it never opens a session |
+| `protocol_guards` | 43 | The reject paths: `Writer` overflow, the §7.1 64‑word cap, bad signature, truncated commands | That well‑formed input is handled *correctly* |
+| `session_loopback` | 90 | The whole lifecycle over real UDP: handshake, dedup across the 64‑entry window, idle declarations, §6.6's three arms, timeouts, graceful close | Any symmetric misreading of the spec — both ends are our code |
+| `host_multiclient` | 23 | §3.2 routing: several Clients on one port, no crosstalk, Bye `0x40` when full, slot reuse | Scale past a handful, or real network conditions |
+| `discovery` | 39 | The §4 contract: TXT limits in **bytes**, the TTL ceiling, and the §4.4 rule that the advertised name is the invited name | That any real responder behaves — the mDNS adapter here is a fake |
+| `fec_sending` | 20 | §7.2.2 ordering (oldest first, new command last), the 1400‑byte cap, the idle interaction | That a real peer's FEC resembles ours |
+| `retransmit` | 25 | §7.2.3–7.2.4 serve, ask, and give up; and that a NAK of our request does not tear the session down | Recovery under genuine packet loss |
+| `auth` | 25 | Both published digest vectors byte‑for‑byte, challenge/response both ways, wrong secret and unknown user rejected | The §6.7 timing defence, and the `0x12`/`0x13` framing, which is inferred rather than transcribed |
+| `session_reset` | 23 | §6.11–6.12 in both directions, and — the point — that traffic still **flows** afterwards | Reset under load |
+
+The row worth staring at is `session_loopback`, and the column is the last one. `session_loopback` is
+the largest suite and the weakest evidence: it runs this library against itself, so any
+misunderstanding of the spec that is applied consistently to both the sending and the
+receiving side passes every check. Two real defects lived there until other people's
+implementations disagreed with us — a NAK livelock (found by the Teensy) and an
+unimplemented `0x11` (found by Tahoe, which sends one on every connection). Neither was
+a coding mistake; both were us being wrong in a mirror, consistently, on both sides.
+
+That is why the interop table above is the more meaningful of the two, and why
+`conformance_vectors` matters out of proportion to its 25 checks: the spec's published
+byte grids are the only fixed point in the repo that we did not write.
+
 ## Features
 
 - **Faithful to M2‑124‑UM** — 4‑byte `MIDI` signature, 32‑bit command header,
@@ -65,7 +95,8 @@ peer.
 - **Injected I/O** — the protocol core is OS‑agnostic; you supply the socket, clock,
   and optionally mDNS and crypto.
 - **Header‑only core** — drop the include dir into your build; no library to link.
-- **Tested** — nine suites, 313 checks, plus the real‑peer bench above.
+- **Tested** — nine suites, 313 checks, plus the real‑peer bench above. What each
+  suite does and does not prove is [tabulated](#tests-what-each-one-is-worth).
 
 ## Design: portable core + injected I/O
 
